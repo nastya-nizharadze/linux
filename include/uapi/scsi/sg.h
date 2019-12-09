@@ -223,6 +223,8 @@ typedef struct sg_req_info {	/* used by SG_GET_REQUEST_TABLE ioctl() */
 #define SG_SEIRV_SUBMITTED	0x5	/* number of mrqs submitted+unread */
 #define SG_SEIRV_DEV_SUBMITTED	0x6	/* sum(submitted) on all dev's fds */
 #define SG_SEIRV_MAX_RSV_REQS	0x7	/* maximum reserve requests */
+#define SG_SEIRV_DEV_TS_LOWER	0x8	/* device timestamp's lower 32 bits */
+#define SG_SEIRV_DEV_TS_UPPER	0x9	/* device timestamp's upper 32 bits */
 
 /*
  * A pointer to the following structure is passed as the third argument to

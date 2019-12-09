@@ -308,6 +308,7 @@ struct sg_device { /* holds the state of each scsi generic device */
 	int max_sgat_elems;     /* adapter's max number of elements in sgat */
 	int max_sgat_sz;	/* max number of bytes in sgat list */
 	u32 index;		/* device index number */
+	u64 create_ns;		/* nanoseconds since bootup device created */
 	atomic_t open_cnt;	/* count of opens (perhaps < num(sfds) ) */
 	unsigned long fdev_bm[1];	/* see SG_FDEV_* defines above */
 	struct gendisk *disk;
@@ -4407,6 +4408,12 @@ sg_extended_read_value(struct sg_fd *sfp, struct sg_extended_info *seip)
 	case SG_SEIRV_MAX_RSV_REQS:
 		seip->read_value = SG_MAX_RSV_REQS;
 		break;
+	case SG_SEIRV_DEV_TS_LOWER:	/* timestamp is 64 bits */
+		seip->read_value = sfp->parentdp->create_ns & U32_MAX;
+		break;
+	case SG_SEIRV_DEV_TS_UPPER:
+		seip->read_value = (sfp->parentdp->create_ns >> 32) & U32_MAX;
+		break;
 	default:
 		SG_LOG(6, sfp, "%s: can't decode %d --> read_value\n",
 		       __func__, seip->read_value);
@@ -5475,6 +5482,7 @@ sg_add_device(struct device *cl_dev, struct class_interface *cl_intf)
 	} else
 		pr_warn("%s: sg_sys Invalid\n", __func__);
 
+	sdp->create_ns = ktime_get_boottime_ns();
 	sg_calc_sgat_param(sdp);
 	sdev_printk(KERN_NOTICE, scsidp, "Attached scsi generic sg%d "
 		    "type %d\n", sdp->index, scsidp->type);
