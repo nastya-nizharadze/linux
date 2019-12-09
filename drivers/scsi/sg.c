@@ -1060,9 +1060,11 @@ sg_mrq_complets(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
 static int
 sg_mrq_sanity(struct sg_device *sdp, struct sg_io_v4 *cop,
 	      struct sg_io_v4 *a_hds, u8 *cdb_ap, struct sg_fd *sfp,
-	      bool immed, u32 tot_reqs)
+	      bool immed, u32 tot_reqs, bool *share_on_othp)
 {
 	bool have_mrq_sense = (cop->response && cop->max_response_len);
+	bool share_on_oth = false;
+	bool share;
 	int k;
 	u32 cdb_alen = cop->request_len;
 	u32 cdb_mxlen = cdb_alen / tot_reqs;
@@ -1085,12 +1087,13 @@ sg_mrq_sanity(struct sg_device *sdp, struct sg_io_v4 *cop,
 			       __func__, rip, k);
 			return -ERANGE;
 		}
+		share = !!(flags & SGV4_FLAG_SHARE);
 		if (immed) {	/* only accept async submits on current fd */
 			if (unlikely(flags & SGV4_FLAG_DO_ON_OTHER)) {
 				SG_LOG(1, sfp, "%s: %s %u, %s\n", __func__,
 				       rip, k, "no IMMED with ON_OTHER");
 				return -ERANGE;
-			} else if (unlikely(flags & SGV4_FLAG_SHARE)) {
+			} else if (unlikely(share)) {
 				SG_LOG(1, sfp, "%s: %s %u, %s\n", __func__,
 				       rip, k, "no IMMED with FLAG_SHARE");
 				return -ERANGE;
@@ -1101,8 +1104,11 @@ sg_mrq_sanity(struct sg_device *sdp, struct sg_io_v4 *cop,
 			}
 			/* N.B. SGV4_FLAG_SIG_ON_OTHER is allowed */
 		}
-		if (!sg_fd_is_shared(sfp)) {
-			if (unlikely(flags & SGV4_FLAG_SHARE)) {
+		if (sg_fd_is_shared(sfp)) {
+			if (!share_on_oth && share)
+				share_on_oth = true;
+		} else {
+			if (unlikely(share)) {
 				SG_LOG(1, sfp, "%s: %s %u, no share\n",
 				       __func__, rip, k);
 				return -ERANGE;
@@ -1125,6 +1131,8 @@ sg_mrq_sanity(struct sg_device *sdp, struct sg_io_v4 *cop,
 			hp->max_response_len = cop->max_response_len;
 		}
 	}
+	if (share_on_othp)
+		*share_on_othp = share_on_othp;
 	return 0;
 }
 
@@ -1242,7 +1250,8 @@ sg_do_multi_req(struct sg_comm_wr_t *cwrp, bool blocking)
 		}
 	}
 	/* do sanity checks on all requests before starting */
-	res = sg_mrq_sanity(sdp, cop, a_hds, cdb_ap, fp, immed, tot_reqs);
+	res = sg_mrq_sanity(sdp, cop, a_hds, cdb_ap, fp, immed, tot_reqs,
+			    NULL);
 	if (unlikely(res))
 		goto fini;
 	set_this = false;
