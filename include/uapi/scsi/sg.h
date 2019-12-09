@@ -157,6 +157,72 @@ typedef struct sg_req_info {	/* used by SG_GET_REQUEST_TABLE ioctl() */
 } sg_req_info_t;
 
 /*
+ * The following defines are for manipulating struct sg_extended_info which
+ * is abbreviated to "SEI". A following "M" (i.e. "_SEIM_") indicates a
+ * mask. Most mask values correspond to a integer (usually a uint32_t) apart
+ * from SG_SEIM_CTL_FLAGS which is for boolean values packed into an integer.
+ * The mask values for those booleans start with "SG_CTL_FLAGM_". The scope
+ * of these settings, like most other ioctls, is usually that of the file
+ * descriptor the ioctl is executed on. The "rd:" indication means read-only,
+ * attempts to write to them are ignored. "rd>" means action when reading.
+ */
+#define SG_SEIM_CTL_FLAGS	0x1	/* ctl_flags_mask bits in ctl_flags */
+#define SG_SEIM_READ_VAL	0x2	/* write SG_SEIRV_*, read back value */
+#define SG_SEIM_RESERVED_SIZE	0x4	/* reserved_sz of reserve request */
+#define SG_SEIM_MINOR_INDEX	0x10	/* sg device minor index number */
+#define SG_SEIM_SGAT_ELEM_SZ	0x80	/* sgat element size (>= PAGE_SIZE) */
+#define SG_SEIM_BLK_POLL	0x100	/* call blk_poll, uses 'num' field */
+#define SG_SEIM_ALL_BITS	0x1ff	/* should be OR of previous items */
+
+/* flag and mask values for boolean fields follow */
+#define SG_CTL_FLAGM_TIME_IN_NS	0x1	/* time: nanosecs (def: millisecs) */
+#define SG_CTL_FLAGM_OTHER_OPENS 0x4	/* rd: other sg fd_s on this dev */
+#define SG_CTL_FLAGM_ORPHANS	0x8	/* rd: orphaned requests on this fd */
+#define SG_CTL_FLAGM_Q_TAIL	0x10	/* used for future cmds on this fd */
+#define SG_CTL_FLAGM_NO_DURATION 0x400	/* don't calc command duration */
+#define SG_CTL_FLAGM_ALL_BITS	0xfff	/* should be OR of previous items */
+
+/* Write one of the following values to sg_extended_info::read_value, get... */
+#define SG_SEIRV_INT_MASK	0x0	/* get SG_SEIM_ALL_BITS */
+#define SG_SEIRV_BOOL_MASK	0x1	/* get SG_CTL_FLAGM_ALL_BITS */
+#define SG_SEIRV_VERS_NUM	0x2	/* get driver version number as int */
+#define SG_SEIRV_INACT_RQS	0x3	/* number of inactive requests */
+#define SG_SEIRV_DEV_INACT_RQS	0x4	/* sum(inactive rqs) on owning dev */
+#define SG_SEIRV_SUBMITTED	0x5	/* number of mrqs submitted+unread */
+#define SG_SEIRV_DEV_SUBMITTED	0x6	/* sum(submitted) on all dev's fds */
+
+/*
+ * A pointer to the following structure is passed as the third argument to
+ * ioctl(SG_SET_GET_EXTENDED). Each bit in the *_wr_mask fields causes the
+ * corresponding integer (e.g. reserved_sz) or bit (e.g. the
+ * SG_CTL_FLAG_TIME_IN_NS bit in ctl_flags) to be read from the user space
+ * and modify the driver. Each bit in the *_rd_mask fields causes the
+ * corresponding integer or bit to be fetched from the driver and written
+ * back to the user space. If the same bit is set in both the *_wr_mask and
+ * corresponding *_rd_mask fields, then which one comes first depends on the
+ * setting but no other operation will split the two. This structure is
+ * padded to 96 bytes to allow for new values to be added in the future.
+ */
+
+/* If both sei_wr_mask and sei_rd_mask are 0, this ioctl does nothing */
+struct sg_extended_info {
+	__u32	sei_wr_mask;	/* OR-ed SG_SEIM_* user->driver values */
+	__u32	sei_rd_mask;	/* OR-ed SG_SEIM_* driver->user values */
+	__u32	ctl_flags_wr_mask;	/* OR-ed SG_CTL_FLAGM_* values */
+	__u32	ctl_flags_rd_mask;	/* OR-ed SG_CTL_FLAGM_* values */
+	__u32	ctl_flags;	/* bit values OR-ed, see SG_CTL_FLAGM_* */
+	__u32	read_value;	/* write SG_SEIRV_*, read back related */
+
+	__u32	reserved_sz;	/* data/sgl size of pre-allocated request */
+	__u32	tot_fd_thresh;	/* total data/sgat for this fd, 0: no limit */
+	__u32	minor_index;	/* rd: kernel's sg device minor number */
+	__u32	share_fd;	/* SHARE_FD and CHG_SHARE_FD use this */
+	__u32	sgat_elem_sz;	/* sgat element size (must be power of 2) */
+	__s32	num;		/* blk_poll: loop_count (-1 -> spin)) */
+	__u8	pad_to_96[48];	/* pad so struct is 96 bytes long */
+};
+
+/*
  * IOCTLs: Those ioctls that are relevant to the SG 3.x drivers follow.
  * [Those that only apply to the SG 2.x drivers are at the end of the file.]
  * (_GET_s yield result via 'int *' 3rd argument unless otherwise indicated)
@@ -184,6 +250,9 @@ typedef struct sg_req_info {	/* used by SG_GET_REQUEST_TABLE ioctl() */
  * version 4.0.01 sg driver and later.
  */
 #define SG_IOCTL_MAGIC_NUM 0x22
+
+#define SG_SET_GET_EXTENDED _IOWR(SG_IOCTL_MAGIC_NUM, 0x51,	\
+				  struct sg_extended_info)
 
 /* The following ioctl has a 'sg_scsi_id_t *' object as its 3rd argument. */
 #define SG_GET_SCSI_ID 0x2276   /* Yields fd's bus, chan, dev, lun + type */
