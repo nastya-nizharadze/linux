@@ -100,13 +100,13 @@ enum sg_rq_state {	/* N.B. sg_rq_state_arr assumes SG_RQ_AWAIT_RCV==2 */
 	SG_RQ_SHR_IN_WS,	/* read-side: waits while write-side inflight */
 };
 
-/* write-side sets up sharing: ioctl(ws_fd,SG_SET_GET_EXTENDED(SHARE_FD(rs_fd))) */
+/* these varieties of share requests are known before a request is created */
 enum sg_shr_var {
-	SG_SHR_NONE = 0,	/* no sharing on this fd, so _not_ shared request */
-	SG_SHR_RS_NOT_SRQ,	/* read-side fd but _not_ shared request */
-	SG_SHR_RS_RQ,		/* read-side sharing on this request */
-	SG_SHR_WS_NOT_SRQ,	/* write-side fd but _not_ shared request */
-	SG_SHR_WS_RQ,		/* write-side sharing on this request */
+	SG_SHR_NONE = 0,	/* no sharing on owning fd */
+	SG_SHR_RS_NOT_SRQ,	/* read-side sharing on fd but not on this req */
+	SG_SHR_RS_RQ,		/* read-side sharing on this data carrying req */
+	SG_SHR_WS_NOT_SRQ,	/* write-side sharing on fd but not on this req */
+	SG_SHR_WS_RQ,		/* write-side sharing on this data carrying req */
 };
 
 /* If sum_of(dlen) of a fd exceeds this, write() will yield E2BIG */
@@ -1503,6 +1503,8 @@ this_found:
 				if (cop->din_xfer_len > 0)
 					--cop->din_resid;
 				if (srp->s_hdr4.dir != SG_DXFER_FROM_DEV)
+					continue;
+				if (test_bit(SG_FFD_READ_SIDE_ERR, fp->ffd_bm))
 					continue;
 				/* read-side req completed, submit its write-side */
 				rs_srp = srp;
@@ -3084,19 +3086,18 @@ sg_calc_sgat_param(struct sg_device *sdp)
 }
 
 /*
- * Only valid for shared file descriptors, else -EINVAL. Should only be
- * called after a read-side request has successfully completed so that
- * there is valid data in reserve buffer. If fini1_again0 is true then
- * read-side is taken out of the state waiting for a write-side request and the
- * read-side is put in the inactive state. If fini1_again0 is false (0) then
- * the read-side (assuming it is inactive) is put in a state waiting for
- * a write-side request. This function is called when the write mask is set on
- * ioctl(SG_SET_GET_EXTENDED(SG_CTL_FLAGM_READ_SIDE_FINI)).
+ * Only valid for shared file descriptors. Designed to be called after a
+ * read-side request has successfully completed leaving valid data in a
+ * reserve request buffer. The read-side is moved from SG_RQ_SHR_SWAP
+ * to SG_RQ_INACTIVE state and returns 0. Acts on first reserve requests.
+ * Otherwise -EINVAL is returned, unless write-side is in progress in
+ * which case -EBUSY is returned.
  */
 static int
-sg_change_after_read_side_rq(struct sg_fd *sfp, bool fini1_again0)
+sg_finish_rs_rq(struct sg_fd *sfp)
 {
 	int res = -EINVAL;
+	int k;
 	enum sg_rq_state sr_st;
 	unsigned long iflags;
 	struct sg_fd *rs_sfp;
@@ -3108,51 +3109,44 @@ sg_change_after_read_side_rq(struct sg_fd *sfp, bool fini1_again0)
 		goto fini;
 	if (xa_get_mark(&sdp->sfp_arr, sfp->idx, SG_XA_FD_RS_SHARE))
 		rs_sfp = sfp;
-	rs_rsv_srp = rs_sfp->rsv_arr[0];
-	if (IS_ERR_OR_NULL(rs_rsv_srp))
-		goto fini;
 
-	res = 0;
-	xa_lock_irqsave(&rs_sfp->srp_arr, iflags);
-	sr_st = atomic_read(&rs_rsv_srp->rq_st);
-	if (fini1_again0) {	/* finish req share after read-side req */
+	for (k = 0; k < SG_MAX_RSV_REQS; ++k) {
+		res = -EINVAL;
+		rs_rsv_srp = rs_sfp->rsv_arr[k];
+		if (IS_ERR_OR_NULL(rs_rsv_srp))
+			continue;
+		xa_lock_irqsave(&rs_sfp->srp_arr, iflags);
+		sr_st = atomic_read(&rs_rsv_srp->rq_st);
 		switch (sr_st) {
 		case SG_RQ_SHR_SWAP:
-			rs_rsv_srp->sh_var = SG_SHR_RS_NOT_SRQ;
-			rs_rsv_srp = NULL;
-			res = sg_rq_chg_state(rs_rsv_srp, sr_st, SG_RQ_INACTIVE);
+			res = sg_rq_chg_state_ulck(rs_rsv_srp, sr_st, SG_RQ_BUSY);
 			if (!res)
 				atomic_inc(&rs_sfp->inactives);
+			rs_rsv_srp->tag = SG_TAG_WILDCARD;
+			rs_rsv_srp->sh_var = SG_SHR_NONE;
+			set_bit(SG_FRQ_RESERVED, rs_rsv_srp->frq_bm);
+			rs_rsv_srp->in_resid = 0;
+			rs_rsv_srp->rq_info = 0;
+			rs_rsv_srp->sense_len = 0;
+			rs_rsv_srp->sh_srp = NULL;
+			sg_finish_scsi_blk_rq(rs_rsv_srp);
+			sg_deact_request(rs_rsv_srp->parentfp, rs_rsv_srp);
 			break;
 		case SG_RQ_SHR_IN_WS:	/* too late, write-side rq active */
 		case SG_RQ_BUSY:
-			res = -EAGAIN;
+			res = -EBUSY;
 			break;
 		default:
 			res = -EINVAL;
 			break;
 		}
-	} else {	/* again: tweak state to allow another write-side request */
-		switch (sr_st) {
-		case SG_RQ_INACTIVE:
-			rs_rsv_srp->sh_var = SG_SHR_RS_RQ;
-			res = sg_rq_chg_state(rs_rsv_srp, sr_st, SG_RQ_SHR_SWAP);
-			break;
-		case SG_RQ_SHR_SWAP:
-			break;	/* already done, redundant call? */
-		default:	/* all other states */
-			res = -EBUSY;	/* read-side busy doing ... */
-			break;
-		}
+		xa_unlock_irqrestore(&rs_sfp->srp_arr, iflags);
+		if (res == 0)
+			return res;
 	}
-	xa_unlock_irqrestore(&rs_sfp->srp_arr, iflags);
 fini:
-	if (unlikely(res)) {
+	if (unlikely(res))
 		SG_LOG(1, sfp, "%s: err=%d\n", __func__, -res);
-	} else {
-		SG_LOG(6, sfp, "%s: okay, fini1_again0=%d\n", __func__,
-		       fini1_again0);
-	}
 	return res;
 }
 
@@ -4298,11 +4292,9 @@ sg_extended_bool_flags(struct sg_fd *sfp, struct sg_extended_info *seip)
 			c_flgs_val_out &= ~SG_CTL_FLAGM_READ_SIDE_FINI;
 		}
 	}
-	if (c_flgs_wm & SG_CTL_FLAGM_READ_SIDE_FINI) {
-		bool rs_fini_wm = !!(c_flgs_val_in & SG_CTL_FLAGM_READ_SIDE_FINI);
-
-		res = sg_change_after_read_side_rq(sfp, rs_fini_wm);
-	}
+	if ((c_flgs_wm & SG_CTL_FLAGM_READ_SIDE_FINI) &&
+	    (c_flgs_val_in & SG_CTL_FLAGM_READ_SIDE_FINI))
+		res = sg_finish_rs_rq(sfp);
 	/* READ_SIDE_ERR boolean, [ro] share: read-side finished with error */
 	if (c_flgs_rm & SG_CTL_FLAGM_READ_SIDE_ERR) {
 		rs_sfp = sg_fd_share_ptr(sfp);
