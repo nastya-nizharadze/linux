@@ -360,6 +360,7 @@ static struct sg_device *sg_get_dev(int min_dev);
 static void sg_device_destroy(struct kref *kref);
 static struct sg_request *sg_mk_srp_sgat(struct sg_fd *sfp, bool first,
 					 int db_len);
+static int sg_abort_req(struct sg_fd *sfp, struct sg_request *srp);
 static int sg_sfp_blk_poll(struct sg_fd *sfp, int loop_count);
 static int sg_srp_q_blk_poll(struct sg_request *srp, struct request_queue *q,
 			     int loop_count);
@@ -553,7 +554,7 @@ sg_open(struct inode *inode, struct file *filp)
 		goto error_out;
 
 	mutex_lock(&sdp->open_rel_lock);
-	if (op_flags & O_NONBLOCK) {
+	if (non_block) {
 		if (unlikely(o_excl)) {
 			if (atomic_read(&sdp->open_cnt) > 0) {
 				res = -EBUSY;
@@ -588,7 +589,7 @@ sg_open(struct inode *inode, struct file *filp)
 	mutex_unlock(&sdp->open_rel_lock);
 	SG_LOG(3, sfp, "%s: o_count after=%d on minor=%d, op_flags=0x%x%s\n",
 	       __func__, o_count, min_dev, op_flags,
-	       ((op_flags & O_NONBLOCK) ? " O_NONBLOCK" : ""));
+	       (non_block ? " O_NONBLOCK" : ""));
 
 	res = 0;
 sg_put:
@@ -652,8 +653,8 @@ sg_release(struct inode *inode, struct file *filp)
 		return -ENXIO;
 
 	if (unlikely(xa_get_mark(&sdp->sfp_arr, sfp->idx, SG_XA_FD_FREE))) {
-		SG_LOG(1, sfp, "%s: sfp erased!!!\n", __func__);
-		return 0;	/* get out but can't fail */
+		SG_LOG(1, sfp, "%s: sfp already erased!!!\n", __func__);
+		return 0;       /* yell out but can't fail */
 	}
 
 	mutex_lock(&sdp->open_rel_lock);
@@ -2055,6 +2056,7 @@ sg_mrq_iorec_complets(struct sg_fd *sfp, bool non_block, int max_mrqs,
 }
 
 /*
+ * Invoked when user calls ioctl(SG_IORECEIVE, SGV4_FLAG_MULTIPLE_REQS).
  * Expected race as multiple concurrent calls with the same pack_id/tag can
  * occur. Only one should succeed per request (more may succeed but will get
  * different requests).
@@ -2097,7 +2099,7 @@ sg_mrq_ioreceive(struct sg_fd *sfp, struct sg_io_v4 *cop, void __user *p,
 		if (copy_to_user(pp, rsp_v4_arr, len))
 			res = -EFAULT;
 	} else {
-		pr_info("%s: cop->din_xferp==NULL ?_?\n", __func__);
+		SG_LOG(1, sfp, "%s: cop->din_xferp==NULL ?_?\n", __func__);
 	}
 fini:
 	kfree(rsp_v4_arr);
@@ -2525,28 +2527,26 @@ sg_calc_sgat_param(struct sg_device *sdp)
 static int
 sg_change_after_read_side_rq(struct sg_fd *sfp, bool fini1_again0)
 {
-	int res = 0;
+	int res = -EINVAL;
 	enum sg_rq_state sr_st;
 	unsigned long iflags;
 	struct sg_fd *rs_sfp;
-	struct sg_request *rs_rsv_srp = NULL;
+	struct sg_request *rs_rsv_srp;
 	struct sg_device *sdp = sfp->parentdp;
 
 	rs_sfp = sg_fd_share_ptr(sfp);
-	if (unlikely(!rs_sfp)) {
-		res = -EINVAL;
-	} else if (xa_get_mark(&sdp->sfp_arr, sfp->idx, SG_XA_FD_RS_SHARE)) {
-		rs_rsv_srp = sfp->rsv_srp;
+	if (unlikely(!rs_sfp))
+		goto fini;
+	if (xa_get_mark(&sdp->sfp_arr, sfp->idx, SG_XA_FD_RS_SHARE))
 		rs_sfp = sfp;
-	} else {	/* else called on write-side */
-		rs_rsv_srp = rs_sfp->rsv_srp;
-	}
-	if (res || !rs_rsv_srp)
+	rs_rsv_srp = sfp->rsv_srp;
+	if (IS_ERR_OR_NULL(rs_rsv_srp))
 		goto fini;
 
+	res = 0;
 	xa_lock_irqsave(&rs_sfp->srp_arr, iflags);
 	sr_st = atomic_read(&rs_rsv_srp->rq_st);
-	if (fini1_again0) {
+	if (fini1_again0) {	/* finish req share after read-side req */
 		switch (sr_st) {
 		case SG_RQ_SHR_SWAP:
 			rs_rsv_srp->sh_var = SG_SHR_RS_NOT_SRQ;
@@ -2563,7 +2563,7 @@ sg_change_after_read_side_rq(struct sg_fd *sfp, bool fini1_again0)
 			res = -EINVAL;
 			break;
 		}
-	} else {
+	} else {	/* again: tweak state to allow another write-side request */
 		switch (sr_st) {
 		case SG_RQ_INACTIVE:
 			rs_rsv_srp->sh_var = SG_SHR_RS_RQ;
@@ -5777,8 +5777,8 @@ sg_setup_req(struct sg_comm_wr_t *cwrp, enum sg_shr_var sh_var, int dxfr_len)
 	struct sg_request *rs_rsv_srp = NULL;
 	struct sg_fd *rs_sfp = NULL;
 	struct xarray *xafp = &fp->srp_arr;
-	__maybe_unused const char *cp;
-	char b[48];
+	__maybe_unused const char *cp = NULL;
+	__maybe_unused char b[64];
 
 	b[0] = '\0';
 	rsv_srp = fp->rsv_srp;
@@ -6589,6 +6589,7 @@ static int
 sg_proc_debug_fd(struct sg_fd *fp, char *obp, int len, unsigned long idx,
 		 bool reduced)
 {
+	bool set_debug;
 	bool t_in_ns = test_bit(SG_FFD_TIME_IN_NS, fp->ffd_bm);
 	int n = 0;
 	int to, k;
@@ -6602,6 +6603,7 @@ sg_proc_debug_fd(struct sg_fd *fp, char *obp, int len, unsigned long idx,
 			" shr_rs" : " shr_rs";
 	else
 		cp = "";
+	set_debug = test_bit(SG_FDEV_LOG_SENSE, sdp->fdev_bm);
 	/* sgat=-1 means unavailable */
 	to = (fp->timeout >= 0) ? jiffies_to_msecs(fp->timeout) : -999;
 	if (to < 0)
@@ -6638,10 +6640,16 @@ sg_proc_debug_fd(struct sg_fd *fp, char *obp, int len, unsigned long idx,
 				       idx, srp->rq_idx);
 		if (xa_get_mark(&fp->srp_arr, idx, SG_XA_RQ_INACTIVE))
 			continue;
+		if (set_debug)
+			n += scnprintf(obp + n, len - n, "     frq_bm=0x%lx  ",
+				       srp->frq_bm[0]);
+		else if (test_bit(SG_FRQ_ABORTING, srp->frq_bm))
+			n += scnprintf(obp + n, len - n,
+				       "     abort>> ");
 		n += sg_proc_debug_sreq(srp, fp->timeout, t_in_ns, obp + n,
 					len - n);
 		++k;
-		if ((k % 8) == 0) {     /* don't hold up isr_s too long */
+		if ((k % 8) == 0) {	/* don't hold up isr_s too long */
 			xa_unlock_irqrestore(&fp->srp_arr, iflags);
 			cpu_relax();
 			xa_lock_irqsave(&fp->srp_arr, iflags);
@@ -6653,10 +6661,13 @@ sg_proc_debug_fd(struct sg_fd *fp, char *obp, int len, unsigned long idx,
 	xa_for_each_marked(&fp->srp_arr, idx, srp, SG_XA_RQ_INACTIVE) {
 		if (k == 0)
 			n += scnprintf(obp + n, len - n, "   Inactives:\n");
+		if (set_debug)
+			n += scnprintf(obp + n, len - n, "     frq_bm=0x%lx  ",
+				       srp->frq_bm[0]);
 		n += sg_proc_debug_sreq(srp, fp->timeout, t_in_ns,
 					obp + n, len - n);
 		++k;
-		if ((k % 8) == 0) {     /* don't hold up isr_s too long */
+		if ((k % 8) == 0) {	/* don't hold up isr_s too long */
 			xa_unlock_irqrestore(&fp->srp_arr, iflags);
 			cpu_relax();
 			xa_lock_irqsave(&fp->srp_arr, iflags);
@@ -6756,8 +6767,8 @@ sg_proc_seq_show_debug(struct seq_file *s, void *v, bool reduced)
 		found = true;
 		disk_name = (sdp->disk ? sdp->disk->disk_name : "?_?");
 		if (SG_IS_DETACHING(sdp)) {
-			snprintf(b1, sizeof(b1), " >>> device=%s  %s\n",
-				 disk_name, "detaching pending close\n");
+			snprintf(b1, sizeof(b1), " >>> %s %s\n", disk_name,
+				 "detaching pending close\n");
 		} else if (sdp->device) {
 			n = sg_proc_debug_sdev(sdp, bp, bp_len, fdi_p,
 					       reduced);
