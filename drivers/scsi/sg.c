@@ -139,6 +139,7 @@ enum sg_shr_var {
 #define SG_FRQ_FOR_MMAP		7	/* request needs PAGE_SIZE elements */
 #define SG_FRQ_COUNT_ACTIVE	8	/* sfp->submitted + waiting active */
 #define SG_FRQ_ISSUED		9	/* blk_execute_rq_nowait() finished */
+#define SG_FRQ_POLL_SLEPT	10	/* stop re-entry of hybrid_sleep() */
 
 /* Bit positions (flags) for sg_fd::ffd_bm bitmask follow */
 #define SG_FFD_FORCE_PACKID	0	/* receive only given pack_id/tag */
@@ -153,6 +154,7 @@ enum sg_shr_var {
 #define SG_FFD_NO_DURATION	9	/* don't do command duration calc */
 #define SG_FFD_MORE_ASYNC	10	/* yield EBUSY more often */
 #define SG_FFD_MRQ_ABORT	11	/* SG_IOABORT + FLAG_MULTIPLE_REQS */
+#define SG_FFD_EXCL_WAITQ	12	/* append _exclusive to wait_event */
 
 /* Bit positions (flags) for sg_device::fdev_bm bitmask follow */
 #define SG_FDEV_EXCLUDE		0	/* have fd open with O_EXCL */
@@ -963,6 +965,17 @@ sg_mrq_1complet(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
 	return 0;
 }
 
+static int
+sg_wait_mrq_event(struct sg_fd *sfp, struct sg_request **srpp)
+{
+	if (test_bit(SG_FFD_EXCL_WAITQ, sfp->ffd_bm))
+		return __wait_event_interruptible_exclusive
+					(sfp->cmpl_wait,
+					 sg_mrq_get_ready_srp(sfp, srpp));
+	return __wait_event_interruptible(sfp->cmpl_wait,
+					  sg_mrq_get_ready_srp(sfp, srpp));
+}
+
 /*
  * This is a fair-ish algorithm for an interruptible wait on two file
  * descriptors. It favours the main fd over the secondary fd (sec_sfp).
@@ -1003,9 +1016,7 @@ sg_mrq_complets(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
 					return res;
 			}
 		} else if (mreqs > 0) {
-			res = wait_event_interruptible
-					(sfp->cmpl_wait,
-					 sg_mrq_get_ready_srp(sfp, &srp));
+			res = sg_wait_mrq_event(sfp, &srp);
 			if (unlikely(res))
 				return res;	/* signal --> -ERESTARTSYS */
 			if (IS_ERR(srp)) {
@@ -1018,9 +1029,7 @@ sg_mrq_complets(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
 					return res;
 			}
 		} else if (sec_reqs > 0) {
-			res = wait_event_interruptible
-					(sec_sfp->cmpl_wait,
-					 sg_mrq_get_ready_srp(sec_sfp, &srp));
+			res = sg_wait_mrq_event(sec_sfp, &srp);
 			if (unlikely(res))
 				return res;	/* signal --> -ERESTARTSYS */
 			if (IS_ERR(srp)) {
@@ -1083,6 +1092,7 @@ sg_mrq_sanity(struct sg_device *sdp, struct sg_io_v4 *cop,
 				       rip, k, "no IMMED with COMPLETE_B4");
 				return -ERANGE;
 			}
+			/* N.B. SGV4_FLAG_SIG_ON_OTHER is allowed */
 		}
 		if (!sg_fd_is_shared(sfp)) {
 			if (unlikely(flags & SGV4_FLAG_SHARE)) {
@@ -1114,8 +1124,9 @@ sg_mrq_sanity(struct sg_device *sdp, struct sg_io_v4 *cop,
 /*
  * Implements the multiple request functionality. When 'blocking' is true
  * invocation was via ioctl(SG_IO), otherwise it was via ioctl(SG_IOSUBMIT).
- * Only fully non-blocking if IMMED flag given or when ioctl(SG_IOSUBMIT)
- * is used with O_NONBLOCK set on its file descriptor.
+ * Submit non-blocking if IMMED flag given or when ioctl(SG_IOSUBMIT)
+ * is used with O_NONBLOCK set on its file descriptor. Hipri non-blocking
+ * is when the HIPRI flag is given.
  */
 static int
 sg_do_multi_req(struct sg_comm_wr_t *cwrp, bool blocking)
@@ -1175,8 +1186,7 @@ sg_do_multi_req(struct sg_comm_wr_t *cwrp, bool blocking)
 		immed = true;
 	SG_LOG(3, fp, "%s: %s, tot_reqs=%u, id_of_mrq=%d\n", __func__,
 	       (immed ? "IMMED" : (blocking ?  "ordered blocking" :
-				   "variable blocking")),
-	       tot_reqs, id_of_mrq);
+				   "variable blocking")), tot_reqs, id_of_mrq);
 	sg_sgv4_out_zero(cop);
 
 	if (unlikely(tot_reqs > U16_MAX)) {
@@ -2025,9 +2035,7 @@ sg_mrq_iorec_complets(struct sg_fd *sfp, bool non_block, int max_mrqs,
 		return k;
 
 	for ( ; k < max_mrqs; ++k) {
-		res = wait_event_interruptible
-				(sfp->cmpl_wait,
-				 sg_mrq_get_ready_srp(sfp, &srp));
+		res = sg_wait_mrq_event(sfp, &srp);
 		if (unlikely(res))
 			return res;	/* signal --> -ERESTARTSYS */
 		if (IS_ERR(srp))
@@ -2090,6 +2098,19 @@ fini:
 	return res;
 }
 
+static int
+sg_wait_id_event(struct sg_fd *sfp, struct sg_request **srpp, int id,
+		 bool is_tag)
+{
+	if (test_bit(SG_FFD_EXCL_WAITQ, sfp->ffd_bm))
+		return __wait_event_interruptible_exclusive
+				(sfp->cmpl_wait,
+				 sg_get_ready_srp(sfp, srpp, id, is_tag));
+	return __wait_event_interruptible
+			(sfp->cmpl_wait,
+			 sg_get_ready_srp(sfp, srpp, id, is_tag));
+}
+
 /*
  * Called when ioctl(SG_IORECEIVE) received. Expects a v4 interface object.
  * Checks if O_NONBLOCK file flag given, if not checks given 'flags' field
@@ -2141,9 +2162,7 @@ try_again:
 			return -ENODEV;
 		if (non_block)
 			return -EAGAIN;
-		res = wait_event_interruptible
-				(sfp->cmpl_wait,
-				 sg_get_ready_srp(sfp, &srp, id, use_tag));
+		res = sg_wait_id_event(sfp, &srp, id, use_tag);
 		if (unlikely(res))
 			return res;	/* signal --> -ERESTARTSYS */
 		if (IS_ERR(srp))
@@ -2198,9 +2217,7 @@ try_again:
 			return -ENODEV;
 		if (non_block)
 			return -EAGAIN;
-		res = wait_event_interruptible
-				(sfp->cmpl_wait,
-				 sg_get_ready_srp(sfp, &srp, pack_id, false));
+		res = sg_wait_id_event(sfp, &srp, pack_id, false);
 		if (unlikely(res))
 			return res;	/* signal --> -ERESTARTSYS */
 		if (IS_ERR(srp))
@@ -2358,7 +2375,7 @@ sg_read(struct file *filp, char __user *p, size_t count, loff_t *ppos)
 					int flgs;
 
 					ret = get_user(flgs, &h3_up->flags);
-					if (ret)
+					if (unlikely(ret))
 						return ret;
 					if (flgs & SGV4_FLAG_IMMED)
 						non_block = true;
@@ -2381,9 +2398,7 @@ try_again:
 			return -ENODEV;
 		if (non_block) /* O_NONBLOCK or v3::flags & SGV4_FLAG_IMMED */
 			return -EAGAIN;
-		ret = wait_event_interruptible
-				(sfp->cmpl_wait,
-				 sg_get_ready_srp(sfp, &srp, want_id, false));
+		ret = sg_wait_id_event(sfp, &srp, want_id, false);
 		if (unlikely(ret))  /* -ERESTARTSYS as signal hit process */
 			return ret;
 		if (IS_ERR(srp))
@@ -2853,9 +2868,9 @@ sg_wait_event_srp(struct sg_fd *sfp, void __user *p, struct sg_io_v4 *h4p,
 		goto skip_wait;
 	}
 	SG_LOG(3, sfp, "%s: about to wait_event...()\n", __func__);
-	/* usually will be woken up by sg_rq_end_io() callback */
-	res = wait_event_interruptible(sfp->cmpl_wait,
-				       sg_rq_landed(sdp, srp));
+	/* N.B. The SG_FFD_EXCL_WAITQ flag is ignored here. */
+	res = __wait_event_interruptible(sfp->cmpl_wait,
+					 sg_rq_landed(sdp, srp));
 	if (unlikely(res)) { /* -ERESTARTSYS because signal hit thread */
 		set_bit(SG_FRQ_IS_ORPHAN, srp->frq_bm);
 		/* orphans harvested when sfp->keep_orphan is false */
@@ -3323,7 +3338,7 @@ sg_find_sfp_by_fd(const struct file *search_for, int search_fd,
 	++num_d;
 	for (k = 0; k < num_d; ++k) {
 		sdp = idr_find(&sg_index_idr, k);
-		if (unlikely(!sdp || SG_IS_DETACHING(sdp)))
+		if (unlikely(!sdp) || SG_IS_DETACHING(sdp))
 			continue;
 		xa_for_each_marked(&sdp->sfp_arr, idx, sfp,
 				   SG_XA_FD_UNSHARED) {
@@ -3361,7 +3376,7 @@ sg_find_sfp_by_fd(const struct file *search_for, int search_fd,
 		++num_d;
 		for (k = 0; k < num_d; ++k) {
 			sdp = idr_find(&sg_index_idr, k);
-			if (unlikely(!sdp || SG_IS_DETACHING(sdp)))
+			if (unlikely(!sdp) || SG_IS_DETACHING(sdp))
 				continue;
 			xa_for_each(&sdp->sfp_arr, idx, sfp) {
 				if (!sg_fd_is_shared(sfp))
@@ -3741,6 +3756,18 @@ sg_extended_bool_flags(struct sg_fd *sfp, struct sg_extended_info *seip)
 			c_flgs_val_out |= SG_CTL_FLAGM_MORE_ASYNC;
 		else
 			c_flgs_val_out &= ~SG_CTL_FLAGM_MORE_ASYNC;
+	}
+	/* EXCL_WAITQ boolean, [rbw] */
+	if (c_flgs_rm & SG_CTL_FLAGM_EXCL_WAITQ)
+		flg = test_bit(SG_FFD_EXCL_WAITQ, sfp->ffd_bm);
+	if (c_flgs_wm & SG_CTL_FLAGM_EXCL_WAITQ)
+		assign_bit(SG_FFD_EXCL_WAITQ, sfp->ffd_bm,
+			   !!(c_flgs_val_in & SG_CTL_FLAGM_EXCL_WAITQ));
+	if (c_flgs_rm & SG_CTL_FLAGM_EXCL_WAITQ) {
+		if (flg)
+			c_flgs_val_out |= SG_CTL_FLAGM_EXCL_WAITQ;
+		else
+			c_flgs_val_out &= ~SG_CTL_FLAGM_EXCL_WAITQ;
 	}
 
 	if (c_flgs_val_in != c_flgs_val_out)

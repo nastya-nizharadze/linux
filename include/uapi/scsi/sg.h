@@ -114,16 +114,16 @@ typedef struct sg_io_hdr {
 #define SGV4_FLAG_YIELD_TAG 0x8  /* sg_io_v4::generated_tag set after SG_IOS */
 #define SGV4_FLAG_Q_AT_TAIL SG_FLAG_Q_AT_TAIL
 #define SGV4_FLAG_Q_AT_HEAD SG_FLAG_Q_AT_HEAD
-#define SGV4_FLAG_COMPLETE_B4  0x100
-#define SGV4_FLAG_SIGNAL  0x200	/* v3: ignored; v4 signal on completion */
-#define SGV4_FLAG_IMMED 0x400 /* for polling with SG_IOR, ignored in SG_IOS */
+#define SGV4_FLAG_COMPLETE_B4  0x100	/* mrq: complete this rq before next */
+#define SGV4_FLAG_SIGNAL 0x200	/* v3: ignored; v4 signal on completion */
+#define SGV4_FLAG_IMMED 0x400   /* issue request and return immediately ... */
 #define SGV4_FLAG_HIPRI 0x800 /* request will use blk_poll to complete */
 #define SGV4_FLAG_STOP_IF 0x1000	/* Stops sync mrq if error or warning */
 #define SGV4_FLAG_DEV_SCOPE 0x2000 /* permit SG_IOABORT to have wider scope */
 #define SGV4_FLAG_SHARE 0x4000	/* share IO buffer; needs SG_SEIM_SHARE_FD */
 #define SGV4_FLAG_DO_ON_OTHER 0x8000 /* available on either of shared pair */
 #define SGV4_FLAG_NO_DXFER SG_FLAG_NO_DXFER /* but keep dev<-->kernel xfr */
-#define SGV4_FLAG_MULTIPLE_REQS 0x20000	/* n sg_io_v4s in data-in */
+#define SGV4_FLAG_MULTIPLE_REQS 0x20000	/* 1 or more sg_io_v4-s in data-in */
 
 /* Output (potentially OR-ed together) in v3::info or v4::info field */
 #define SG_INFO_OK_MASK 0x1
@@ -151,7 +151,7 @@ typedef struct sg_scsi_id {
 	short h_cmd_per_lun;/* host (adapter) maximum commands per lun */
 	short d_queue_depth;/* device (or adapter) maximum queue length */
 	union {
-		int unused[2];  /* as per version 3 driver */
+		int unused[2];	/* as per version 3 driver */
 		__u8 scsi_lun[8];  /* full 8 byte SCSI LUN [in v4 driver] */
 	};
 } sg_scsi_id_t;
@@ -163,8 +163,14 @@ typedef struct sg_req_info {	/* used by SG_GET_REQUEST_TABLE ioctl() */
 	/* sg_io_owned set imples synchronous, clear implies asynchronous */
 	char sg_io_owned;/* 0 -> complete with read(), 1 -> owned by SG_IO */
 	char problem;	/* 0 -> no problem detected, 1 -> error to report */
+	/* If SG_CTL_FLAGM_TAG_FOR_PACK_ID set on fd then next field is tag */
 	int pack_id;	/* pack_id, in v4 driver may be tag instead */
 	void __user *usr_ptr;	/* user provided pointer in v3+v4 interface */
+	/*
+	 * millisecs elapsed since the command started (req_state==1) or
+	 * command duration (req_state==2). Will be in nanoseconds after
+	 * the SG_SET_GET_EXTENDED{TIME_IN_NS} ioctl.
+	 */
 	unsigned int duration;
 	int unused;
 } sg_req_info_t;
@@ -199,12 +205,13 @@ typedef struct sg_req_info {	/* used by SG_GET_REQUEST_TABLE ioctl() */
 #define SG_CTL_FLAGM_IS_SHARE	0x20	/* rd: fd is read-side or write-side share */
 #define SG_CTL_FLAGM_IS_READ_SIDE 0x40	/* rd: this fd is read-side share */
 #define SG_CTL_FLAGM_UNSHARE	0x80	/* undo share after inflight cmd */
-/* rd> 1: read-side finished 0: not; wr> 1: finish share post read-side */
+/* rd> 1: read-side finished, 0: not; wr> 1: finish share post read-side */
 #define SG_CTL_FLAGM_READ_SIDE_FINI 0x100 /* wr> 0: setup for repeat write-side req */
 #define SG_CTL_FLAGM_READ_SIDE_ERR 0x200 /* rd: sharing, read-side got error */
 #define SG_CTL_FLAGM_NO_DURATION 0x400	/* don't calc command duration */
 #define SG_CTL_FLAGM_MORE_ASYNC	0x800	/* yield EAGAIN in more cases */
-#define SG_CTL_FLAGM_ALL_BITS	0xfff	/* should be OR of previous items */
+#define SG_CTL_FLAGM_EXCL_WAITQ 0x1000	/* only 1 wake up per response */
+#define SG_CTL_FLAGM_ALL_BITS	0x1fff	/* should be OR of previous items */
 
 /* Write one of the following values to sg_extended_info::read_value, get... */
 #define SG_SEIRV_INT_MASK	0x0	/* get SG_SEIM_ALL_BITS */
@@ -437,9 +444,11 @@ struct sg_header {
 /*
  * New ioctls to replace async (non-blocking) write()/read() interface.
  * Present in version 4 and later of the sg driver [>20190427]. The
- * SG_IOSUBMIT and SG_IORECEIVE ioctls accept the sg_v4 interface based on
- * struct sg_io_v4 found in <include/uapi/linux/bsg.h>. These objects are
- * passed by a pointer in the third argument of the ioctl.
+ * SG_IOSUBMIT_V3 and SG_IORECEIVE_V3 ioctls accept the sg_v3 interface
+ * based on struct sg_io_hdr shown above. The SG_IOSUBMIT and SG_IORECEIVE
+ * ioctls accept the sg_v4 interface based on struct sg_io_v4 found in
+ * <include/uapi/linux/bsg.h>. These objects are passed by a pointer in
+ * the third argument of the ioctl.
  *
  * Data may be transferred both from the user space to the driver by these
  * ioctls. Hence the _IOWR macro is used here to generate the ioctl number
