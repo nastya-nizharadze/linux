@@ -194,6 +194,9 @@ static struct class_interface sg_interface = {
 	.remove_dev     = sg_remove_device,
 };
 
+static DEFINE_MUTEX(snapped_mutex);
+static char *snapped_buf;
+
 /* Subset of sg_io_hdr found in <scsi/sg.h>, has only [i] and [i->o] fields */
 struct sg_slice_hdr3 {
 	int interface_id;
@@ -364,6 +367,11 @@ static int sg_srp_q_blk_poll(struct sg_request *srp, struct request_queue *q,
 static const char *sg_rq_st_str(enum sg_rq_state rq_st, bool long_str);
 static const char *sg_shr_str(enum sg_shr_var sh_var, bool long_str);
 #endif
+#if IS_ENABLED(SG_PROC_OR_DEBUG_FS)
+static int sg_proc_debug_sdev(struct sg_device *sdp, char *obp, int len,
+			      int *fd_counterp, bool reduced);
+static void sg_take_snap(struct sg_fd *sfp, bool clear_first);
+#endif
 
 #define SG_WRITE_COUNT_LIMIT (32 * 1024 * 1024)
 
@@ -391,6 +399,7 @@ static const char *sg_shr_str(enum sg_shr_var sh_var, bool long_str);
  */
 
 #define SG_PROC_DEBUG_SZ 8192
+#define SG_SNAP_BUFF_SZ (SG_PROC_DEBUG_SZ * 8)
 
 #if IS_ENABLED(CONFIG_SCSI_LOGGING) && IS_ENABLED(SG_DEBUG)
 #define SG_LOG_BUFF_SZ 48
@@ -3535,6 +3544,62 @@ sg_any_persistent_orphans(struct sg_fd *sfp)
 	return false;
 }
 
+/* Ignore append if size already over half of available buffer */
+static void
+sg_take_snap(struct sg_fd *sfp, bool dont_append)
+{
+	u32 hour, minute, second;
+	u64 n;
+	struct sg_device *sdp = sfp->parentdp;
+	struct timespec64 ts64;
+	char b[64];
+
+	if (!sdp)
+		return;
+	ktime_get_real_ts64(&ts64);
+	/* prefer local time but sys_tz.tz_minuteswest is always 0 */
+	n = ts64.tv_sec;
+	second = (u32)do_div(n, 60);
+	minute = (u32)do_div(n, 60);
+	hour = (u32)do_div(n, 24);	/* hour within a UTC day */
+	snprintf(b, sizeof(b), "UTC time: %.2u:%.2u:%.2u:%.6u [tid=%d]",
+		 hour, minute, second, (u32)ts64.tv_nsec / 1000,
+		 (current ? current->pid : -1));
+	mutex_lock(&snapped_mutex);
+	if (!snapped_buf) {
+		snapped_buf = kzalloc(SG_SNAP_BUFF_SZ,
+				      GFP_KERNEL | __GFP_NOWARN);
+		if (!snapped_buf)
+			goto fini;
+	} else if (dont_append) {
+		memset(snapped_buf, 0, SG_SNAP_BUFF_SZ);
+	}
+#if IS_ENABLED(SG_PROC_OR_DEBUG_FS)
+	if (true) {	/* for some declarations */
+		int n, prevlen, bp_len;
+		char *bp;
+
+		prevlen = strlen(snapped_buf);
+		if (prevlen > SG_SNAP_BUFF_SZ / 2)
+			prevlen = 0;
+		bp_len = SG_SNAP_BUFF_SZ - prevlen;
+		bp = snapped_buf + prevlen;
+		n = scnprintf(bp, bp_len, "%s\n", b);
+		bp += n;
+		bp_len -= n;
+		if (bp_len < 2)
+			goto fini;
+		n = sg_proc_debug_sdev(sdp, bp, bp_len, NULL, false);
+		if (n >= bp_len - 1) {
+			if (bp[bp_len - 2] != '\n')
+				bp[bp_len - 2] = '\n';
+		}
+	}
+#endif
+fini:
+	mutex_unlock(&snapped_mutex);
+}
+
 /*
  * Processing of ioctl(SG_SET_GET_EXTENDED(SG_SEIM_CTL_FLAGS)) which is a set
  * of boolean flags. Access abbreviations: [rw], read-write; [ro], read-only;
@@ -3688,6 +3753,20 @@ sg_extended_bool_flags(struct sg_fd *sfp, struct sg_extended_info *seip)
 			c_flgs_val_out |= SG_CTL_FLAGM_EXCL_WAITQ;
 		else
 			c_flgs_val_out &= ~SG_CTL_FLAGM_EXCL_WAITQ;
+	}
+	/* SNAP_DEV boolean, [rbw] */
+	if (c_flgs_rm & SG_CTL_FLAGM_SNAP_DEV) {
+		mutex_lock(&snapped_mutex);
+		flg = (snapped_buf && strlen(snapped_buf) > 0);
+		mutex_unlock(&snapped_mutex);
+	}
+	if (c_flgs_wm & SG_CTL_FLAGM_SNAP_DEV)
+		sg_take_snap(sfp, !!(c_flgs_val_in & SG_CTL_FLAGM_SNAP_DEV));
+	if (c_flgs_rm & SG_CTL_FLAGM_SNAP_DEV) {
+		if (flg)
+			c_flgs_val_out |= SG_CTL_FLAGM_SNAP_DEV;
+		else
+			c_flgs_val_out &= ~SG_CTL_FLAGM_SNAP_DEV;
 	}
 
 	if (c_flgs_val_in != c_flgs_val_out)
@@ -4938,6 +5017,7 @@ exit_sg(void)
 	sg_dfs_exit();
 	if (IS_ENABLED(CONFIG_SCSI_PROC_FS))
 		remove_proc_subtree("scsi/sg", NULL);
+	kfree(snapped_buf);
 	scsi_unregister_interface(&sg_interface);
 	mempool_destroy(sg_sense_pool);
 	kmem_cache_destroy(sg_sense_cache);
@@ -6550,6 +6630,10 @@ sg_proc_debug_fd(struct sg_fd *fp, char *obp, int len, unsigned long idx,
 	k = 0;
 	xa_lock_irqsave(&fp->srp_arr, iflags);
 	xa_for_each(&fp->srp_arr, idx, srp) {
+		if (srp->rq_idx != (unsigned long)idx)
+			n += scnprintf(obp + n, len - n,
+				       ">>> xa_index=%lu, rq_idx=%d, bad\n",
+				       idx, srp->rq_idx);
 		if (xa_get_mark(&fp->srp_arr, idx, SG_XA_RQ_INACTIVE))
 			continue;
 		n += sg_proc_debug_sreq(srp, fp->timeout, t_in_ns, obp + n,
@@ -6810,6 +6894,28 @@ struct sg_dfs_attr {
 };
 
 static int
+sg_dfs_snapped_show(void *data, struct seq_file *m)
+{
+	mutex_lock(&snapped_mutex);
+	if (snapped_buf && snapped_buf[0])
+		seq_puts(m, snapped_buf);
+	mutex_unlock(&snapped_mutex);
+	return 0;
+}
+
+static ssize_t
+sg_dfs_snapped_write(void *data, const char __user *buf, size_t count,
+		     loff_t *ppos)
+{
+	/* Any write clears snapped buffer */
+	mutex_lock(&snapped_mutex);
+	kfree(snapped_buf);
+	snapped_buf = NULL;
+	mutex_unlock(&snapped_mutex);
+	return count;
+}
+
+static int
 sg_dfs_snapshot_devs_show(void *data, struct seq_file *m)
 {
 	bool last;
@@ -6970,6 +7076,7 @@ static const struct seq_operations sg_snapshot_summ_seq_ops = {
 };
 
 static const struct sg_dfs_attr sg_dfs_attrs[] = {
+	{"snapped", 0600, sg_dfs_snapped_show, sg_dfs_snapped_write},
 	{"snapshot", 0400, .seq_ops = &sg_snapshot_seq_ops},
 	{"snapshot_devs", 0600, sg_dfs_snapshot_devs_show,
 	 sg_dfs_snapshot_devs_write},
