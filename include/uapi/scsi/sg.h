@@ -114,6 +114,7 @@ typedef struct sg_io_hdr {
 #define SGV4_FLAG_YIELD_TAG 0x8  /* sg_io_v4::generated_tag set after SG_IOS */
 #define SGV4_FLAG_Q_AT_TAIL SG_FLAG_Q_AT_TAIL
 #define SGV4_FLAG_Q_AT_HEAD SG_FLAG_Q_AT_HEAD
+#define SGV4_FLAG_DOUT_OFFSET  0x40	/* dout byte offset in v4::spare_in */
 #define SGV4_FLAG_COMPLETE_B4  0x100	/* mrq: complete this rq before next */
 #define SGV4_FLAG_SIGNAL 0x200	/* v3: ignored; v4 signal on completion */
 #define SGV4_FLAG_IMMED 0x400   /* issue request and return immediately ... */
@@ -123,7 +124,8 @@ typedef struct sg_io_hdr {
 #define SGV4_FLAG_SHARE 0x4000	/* share IO buffer; needs SG_SEIM_SHARE_FD */
 #define SGV4_FLAG_DO_ON_OTHER 0x8000 /* available on either of shared pair */
 #define SGV4_FLAG_NO_DXFER SG_FLAG_NO_DXFER /* but keep dev<-->kernel xfr */
-#define SGV4_FLAG_MULTIPLE_REQS 0x20000	/* 1 or more sg_io_v4-s in data-in */
+#define SGV4_FLAG_KEEP_SHARE 0x20000  /* ... buffer for another dout command */
+#define SGV4_FLAG_MULTIPLE_REQS 0x40000	/* 1 or more sg_io_v4-s in data-in */
 
 /* Output (potentially OR-ed together) in v3::info or v4::info field */
 #define SG_INFO_OK_MASK 0x1

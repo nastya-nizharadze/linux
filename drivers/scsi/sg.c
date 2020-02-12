@@ -220,6 +220,8 @@ struct sg_slice_hdr4 {	/* parts of sg_io_v4 object needed in async usage */
 	void __user *sbp;	/* derived from sg_io_v4::response */
 	u64 usr_ptr;		/* hold sg_io_v4::usr_ptr as given (u64) */
 	int out_resid;
+	u32 wr_offset;		/* from v4::spare_in when flagged; in bytes */
+	u32 wr_len;		/* for shared reqs maybe < read-side */
 	s16 dir;		/* data xfer direction; SG_DXFER_*  */
 	u16 cmd_len;		/* truncated of sg_io_v4::request_len */
 	u16 max_sb_len;		/* truncated of sg_io_v4::max_response_len */
@@ -315,9 +317,11 @@ struct sg_device { /* holds the state of each scsi generic device */
 };
 
 struct sg_comm_wr_t {  /* arguments to sg_common_write() */
+	bool keep_share;
 	int timeout;
 	int cmd_len;
 	int rsv_idx;		/* wanted rsv_arr index, def: -1 (anyone) */
+	int wr_offset;		/* non-zero if v4 and DOUT_OFFSET set */
 	unsigned long frq_bm[1];	/* see SG_FRQ_* defines above */
 	union {		/* selector is frq_bm.SG_FRQ_IS_V4I */
 		struct sg_io_hdr *h3p;
@@ -711,6 +715,14 @@ sg_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+static inline void
+sg_comm_wr_init(struct sg_comm_wr_t *cwrp)
+{
+	memset(cwrp, 0, sizeof(*cwrp));
+	WRITE_ONCE(cwrp->frq_bm[0], 0);
+	cwrp->rsv_idx = -1;
+}
+
 /*
  * ***********************************************************************
  * write(2) related functions follow. They are shown before read(2) related
@@ -857,14 +869,12 @@ to_v2:
 			 __func__, ohp->reply_len - (int)SZ_SG_HEADER,
 			 input_size, (unsigned int)opcode, current->comm);
 	}
+	sg_comm_wr_init(&cwr);
 	cwr.h3p = h3p;
-	WRITE_ONCE(cwr.frq_bm[0], 0);
 	cwr.timeout = sfp->timeout;
 	cwr.cmd_len = cmd_size;
-	cwr.rsv_idx = -1;
 	cwr.sfp = sfp;
 	cwr.u_cmdp = p;
-	cwr.cmdp = NULL;
 	srp = sg_common_write(&cwr);
 	return (IS_ERR(srp)) ? PTR_ERR(srp) : (int)count;
 }
@@ -930,15 +940,13 @@ sg_submit_v3(struct sg_fd *sfp, struct sg_io_hdr *hp, bool sync,
 	if (test_bit(SG_FFD_NO_CMD_Q, sfp->ffd_bm))
 		clear_bit(SG_FFD_NO_CMD_Q, sfp->ffd_bm);
 	ul_timeout = msecs_to_jiffies(hp->timeout);
-	WRITE_ONCE(cwr.frq_bm[0], 0);
+	sg_comm_wr_init(&cwr);
 	__assign_bit(SG_FRQ_SYNC_INVOC, cwr.frq_bm, (int)sync);
 	cwr.h3p = hp;
 	cwr.timeout = min_t(unsigned long, ul_timeout, INT_MAX);
 	cwr.cmd_len = hp->cmd_len;
-	cwr.rsv_idx = -1;
 	cwr.sfp = sfp;
 	cwr.u_cmdp = hp->cmdp;
-	cwr.cmdp = NULL;
 	srp = sg_common_write(&cwr);
 	if (IS_ERR(srp))
 		return PTR_ERR(srp);
@@ -1119,6 +1127,7 @@ sg_mrq_sanity(struct sg_device *sdp, struct sg_io_v4 *cop,
 {
 	bool have_mrq_sense = (cop->response && cop->max_response_len);
 	bool share_on_oth = false;
+	bool last_is_keep_share = false;
 	bool share;
 	int k;
 	u32 cdb_alen = cop->request_len;
@@ -1137,6 +1146,7 @@ sg_mrq_sanity(struct sg_device *sdp, struct sg_io_v4 *cop,
 			       __func__, k, "bad guard");
 			return -ERANGE;
 		}
+		last_is_keep_share = !!(flags & SGV4_FLAG_KEEP_SHARE);
 		if (unlikely(flags & SGV4_FLAG_MULTIPLE_REQS)) {
 			SG_LOG(1, sfp, "%s: %s %u: no nested multi-reqs\n",
 			       __func__, rip, k);
@@ -1185,25 +1195,40 @@ sg_mrq_sanity(struct sg_device *sdp, struct sg_io_v4 *cop,
 			hp->max_response_len = cop->max_response_len;
 		}
 	}
+	if (last_is_keep_share) {
+		SG_LOG(1, sfp,
+		       "%s: Can't set SGV4_FLAG_KEEP_SHARE on last mrq req\n",
+		       __func__);
+		return -ERANGE;
+	}
 	if (share_on_othp)
 		*share_on_othp = share_on_othp;
 	return 0;
 }
 
+/*
+ * Read operation (din) must precede any write (dout) operations and a din
+ * operation can't be last (data transferring) operations. Non data
+ * transferring operations can appear anywhere. Data transferring operations
+ * must have SGV4_FLAG_SHARE set. Dout operations must additionally have
+ * SGV4_FLAG_NO_DXFER and SGV4_FLAG_DO_ON_OTHER set. Din operations must
+ * not set SGV4_FLAG_DO_ON_OTHER.
+ */
 static bool
 sg_mrq_svb_chk(struct sg_io_v4 *a_hds, u32 tot_reqs)
 {
-	bool expect_rd;
+	bool last_rd = false;
+	bool seen_wr = false;
 	int k;
 	u32 flags;
 	struct sg_io_v4 *hp;
 
 	/* expect read-write pairs, all with SGV4_FLAG_NO_DXFER set */
-	for (k = 0, hp = a_hds, expect_rd = true; k < tot_reqs; ++k, ++hp) {
+	for (k = 0, hp = a_hds; k < tot_reqs; ++k, ++hp) {
 		flags = hp->flags;
 		if (flags & (SGV4_FLAG_COMPLETE_B4))
 			return false;
-		if (expect_rd) {
+		if (!seen_wr) {
 			if (hp->dout_xfer_len > 0)
 				return false;
 			if (hp->din_xfer_len > 0) {
@@ -1211,7 +1236,8 @@ sg_mrq_svb_chk(struct sg_io_v4 *a_hds, u32 tot_reqs)
 					return false;
 				if (flags & SGV4_FLAG_DO_ON_OTHER)
 					return false;
-				expect_rd = false;
+				seen_wr = true;
+				last_rd = true;
 			}
 			/* allowing commands with no dxfer */
 		} else {	/* checking write side */
@@ -1220,43 +1246,46 @@ sg_mrq_svb_chk(struct sg_io_v4 *a_hds, u32 tot_reqs)
 				    (SGV4_FLAG_NO_DXFER | SGV4_FLAG_SHARE |
 				     SGV4_FLAG_DO_ON_OTHER))
 					return false;
-				expect_rd = true;
+				last_rd = false;
 			}
-			if (hp->din_xfer_len > 0)
-				return false;
+			if (hp->din_xfer_len > 0) {
+				if (!(flags & SGV4_FLAG_SHARE))
+					return false;
+				if (flags & SGV4_FLAG_DO_ON_OTHER)
+					return false;
+				last_rd = true;
+			}
 		}
 	}
-	if (!expect_rd)
-		return false;
-	return true;
+	return !last_rd;
 }
 
 static struct sg_request *
 sg_mrq_submit(struct sg_fd *rq_sfp, struct sg_mrq_hold *mhp, int pos_hdr,
-	      int rsv_idx)
+	      int rsv_idx, bool keep_share)
 {
 	unsigned long ul_timeout;
 	struct sg_comm_wr_t r_cwr;
 	struct sg_comm_wr_t *r_cwrp = &r_cwr;
 	struct sg_io_v4 *hp = mhp->a_hds + pos_hdr;
 
-	if (mhp->cdb_ap) {	/* already have array of cdbs */
+	sg_comm_wr_init(r_cwrp);
+	if (mhp->cdb_ap)	/* already have array of cdbs */
 		r_cwrp->cmdp = mhp->cdb_ap + (pos_hdr * mhp->cdb_mxlen);
-		r_cwrp->u_cmdp = NULL;
-	} else {	/* fetch each cdb from user space */
-		r_cwrp->cmdp = NULL;
+	else			/* fetch each cdb from user space */
 		r_cwrp->u_cmdp = cuptr64(hp->request);
-	}
 	r_cwrp->cmd_len = hp->request_len;
 	r_cwrp->rsv_idx = rsv_idx;
 	ul_timeout = msecs_to_jiffies(hp->timeout);
-	r_cwrp->frq_bm[0] = 0;
 	__assign_bit(SG_FRQ_SYNC_INVOC, r_cwrp->frq_bm,
 		     (int)mhp->blocking);
 	__set_bit(SG_FRQ_IS_V4I, r_cwrp->frq_bm);
 	r_cwrp->h4p = hp;
 	r_cwrp->timeout = min_t(unsigned long, ul_timeout, INT_MAX);
+	if (hp->flags & SGV4_FLAG_DOUT_OFFSET)
+		r_cwrp->wr_offset = hp->spare_in;
 	r_cwrp->sfp = rq_sfp;
+	r_cwrp->keep_share = keep_share;
 	return sg_common_write(r_cwrp);
 }
 
@@ -1292,7 +1321,7 @@ sg_process_most_mrq(struct sg_fd *fp, struct sg_fd *o_sfp,
 		}
 		flags = hp->flags;
 		rq_sfp = (flags & SGV4_FLAG_DO_ON_OTHER) ? o_sfp : fp;
-		srp = sg_mrq_submit(rq_sfp, mhp, j, -1);
+		srp = sg_mrq_submit(rq_sfp, mhp, j, -1, false);
 		if (IS_ERR(srp)) {
 			mhp->s_res = PTR_ERR(srp);
 			break;
@@ -1383,7 +1412,7 @@ sg_process_svb_mrq(struct sg_fd *fp, struct sg_fd *o_sfp,
 		   struct sg_mrq_hold *mhp)
 {
 	bool aborted = false;
-	bool chk_oth_first;
+	bool chk_oth_first, keep_share;
 	int k, j, i, m, rcv_before, idx, ws_pos, sent;
 	int this_fp_sent, other_fp_sent;
 	int num_subm = 0;
@@ -1438,7 +1467,7 @@ sg_process_svb_mrq(struct sg_fd *fp, struct sg_fd *o_sfp,
 				       __func__, (int)hp->request_extra);
 				rq_sfp = fp;
 			}
-			srp = sg_mrq_submit(rq_sfp, mhp, j, -1);
+			srp = sg_mrq_submit(rq_sfp, mhp, j, -1, false);
 			if (IS_ERR(srp)) {
 				mhp->s_res = PTR_ERR(srp);
 				res = mhp->s_res;	/* don't loop again */
@@ -1527,10 +1556,13 @@ this_found:
 					res = -EPROTO;
 					break;
 				}
+				keep_share = false;
+another_dout:
 				SG_LOG(6, o_sfp,
 				       "%s: submit ws_pos=%d, rs_idx=%d\n",
 				       __func__, ws_pos, idx);
-				srp = sg_mrq_submit(o_sfp, mhp, ws_pos, idx);
+				srp = sg_mrq_submit(o_sfp, mhp, ws_pos, idx,
+						    keep_share);
 				if (IS_ERR(srp)) {
 					mhp->s_res = PTR_ERR(srp);
 					res = mhp->s_res;
@@ -1543,6 +1575,11 @@ this_found:
 				++other_fp_sent;
 				++sent;
 				srp->s_hdr4.mrq_ind = ws_pos;
+				if (srp->rq_flags & SGV4_FLAG_KEEP_SHARE) {
+					++ws_pos;  /* next for same read-side */
+					keep_share = true;
+					goto another_dout;
+				}
 				if (mhp->chk_abort)
 					atomic_set(&srp->s_hdr4.pack_id_of_mrq,
 						   mhp->id_of_mrq);
@@ -1774,6 +1811,7 @@ sg_submit_v4(struct sg_fd *sfp, void __user *p, struct sg_io_v4 *h4p,
 	struct sg_request *srp;
 	struct sg_comm_wr_t cwr;
 
+	sg_comm_wr_init(&cwr);
 	if (h4p->flags & SGV4_FLAG_MULTIPLE_REQS) {
 		/* want v4 async or sync with guard, din and dout and flags */
 		if (!h4p->dout_xferp || h4p->din_iovec_count ||
@@ -1782,7 +1820,6 @@ sg_submit_v4(struct sg_fd *sfp, void __user *p, struct sg_io_v4 *h4p,
 			return -ERANGE;
 		if (o_srp)
 			*o_srp = NULL;
-		memset(&cwr, 0, sizeof(cwr));
 		cwr.sfp = sfp;
 		cwr.h4p = h4p;
 		res = sg_do_multi_req(&cwr, sync);
@@ -1811,15 +1848,14 @@ sg_submit_v4(struct sg_fd *sfp, void __user *p, struct sg_io_v4 *h4p,
 		clear_bit(SG_FFD_NO_CMD_Q, sfp->ffd_bm);
 	ul_timeout = msecs_to_jiffies(h4p->timeout);
 	cwr.sfp = sfp;
-	WRITE_ONCE(cwr.frq_bm[0], 0);
 	__assign_bit(SG_FRQ_SYNC_INVOC, cwr.frq_bm, (int)sync);
 	__set_bit(SG_FRQ_IS_V4I, cwr.frq_bm);
 	cwr.h4p = h4p;
 	cwr.timeout = min_t(unsigned long, ul_timeout, INT_MAX);
 	cwr.cmd_len = h4p->request_len;
-	cwr.rsv_idx = -1;
+	if (h4p->flags & SGV4_FLAG_DOUT_OFFSET)
+		cwr.wr_offset = h4p->spare_in;
 	cwr.u_cmdp = cuptr64(h4p->request);
-	cwr.cmdp = NULL;
 	srp = sg_common_write(&cwr);
 	if (IS_ERR(srp))
 		return PTR_ERR(srp);
@@ -2157,6 +2193,18 @@ sg_get_probable_read_side(struct sg_fd *sfp)
 			break;
 		}
 	}
+	/* Subsequent dout data transfers (e.g. WRITE) on a request share */
+	for (rapp = sfp->rsv_arr; rapp < end_rapp; ++rapp) {
+		rs_srp = *rapp;
+		if (IS_ERR_OR_NULL(rs_srp) || rs_srp->sh_srp)
+			continue;
+		switch (atomic_read(&rs_srp->rq_st)) {
+		case SG_RQ_INACTIVE:
+			return rs_srp;
+		default:
+			break;
+		}
+	}
 	return NULL;
 }
 
@@ -2333,6 +2381,10 @@ sg_common_write(struct sg_comm_wr_t *cwrp)
 		srp->s_hdr4.dir = dir;
 		srp->s_hdr4.out_resid = 0;
 		srp->s_hdr4.mrq_ind = 0;
+		if (dir == SG_DXFER_TO_DEV) {
+			srp->s_hdr4.wr_offset = cwrp->wr_offset;
+			srp->s_hdr4.wr_len = dxfr_len;
+		}
 	} else {	/* v3 interface active */
 		memcpy(&srp->s_hdr3, hi_p, sizeof(srp->s_hdr3));
 	}
@@ -2427,6 +2479,8 @@ sg_rec_state_v3v4(struct sg_fd *sfp, struct sg_request *srp, bool v4_active)
 	int err = 0;
 	u32 rq_res = srp->rq_result;
 	enum sg_shr_var sh_var = srp->sh_var;
+	enum sg_rq_state rs_st = SG_RQ_INACTIVE;
+	struct sg_request *rs_srp;
 
 	if (unlikely(!scsi_status_is_good(rq_res))) {
 		int sb_len_wr = sg_copy_sense(srp, v4_active);
@@ -2440,27 +2494,28 @@ sg_rec_state_v3v4(struct sg_fd *sfp, struct sg_request *srp, bool v4_active)
 		srp->rq_info |= SG_INFO_ABORTED;
 
 	if (sh_var == SG_SHR_WS_RQ && sg_fd_is_shared(sfp)) {
-		enum sg_rq_state rs_st;
-		struct sg_request *rs_srp = srp->sh_srp;
+		__maybe_unused char b[32];
 
+		rs_srp = srp->sh_srp;
 		if (!rs_srp)
 			return -EPROTO;
 		rs_st = atomic_read(&rs_srp->rq_st);
 
 		switch (rs_st) {
 		case SG_RQ_SHR_SWAP:
+			if (!(srp->rq_flags & SGV4_FLAG_KEEP_SHARE))
+				goto set_inactive;
+			SG_LOG(6, sfp, "%s: hold onto %s share\n",
+			       __func__, sg_get_rsv_str(rs_srp, "", "",
+							sizeof(b), b));
+			break;
 		case SG_RQ_SHR_IN_WS:
-			/* make read-side request available for re-use */
-			rs_srp->tag = SG_TAG_WILDCARD;
-			rs_srp->sh_var = SG_SHR_NONE;
-			sg_rq_chg_state_force(rs_srp, SG_RQ_INACTIVE);
-			atomic_inc(&rs_srp->parentfp->inactives);
-			rs_srp->frq_bm[0] = 0;
-			__set_bit(SG_FRQ_RESERVED, rs_srp->frq_bm);
-			rs_srp->in_resid = 0;
-			rs_srp->rq_info = 0;
-			rs_srp->sense_len = 0;
-			rs_srp->sh_srp = NULL;
+			if (!(srp->rq_flags & SGV4_FLAG_KEEP_SHARE))
+				goto set_inactive;
+			err = sg_rq_chg_state(rs_srp, rs_st, SG_RQ_SHR_SWAP);
+			SG_LOG(6, sfp, "%s: hold onto %s share\n",
+			       __func__, sg_get_rsv_str(rs_srp, "", "",
+							sizeof(b), b));
 			break;
 		case SG_RQ_AWAIT_RCV:
 			break;
@@ -2478,6 +2533,18 @@ sg_rec_state_v3v4(struct sg_fd *sfp, struct sg_request *srp, bool v4_active)
 	}
 	if (SG_IS_DETACHING(sfp->parentdp))
 		srp->rq_info |= SG_INFO_DEVICE_DETACHING;
+	return err;
+set_inactive:
+	/* make read-side request available for re-use */
+	rs_srp->tag = SG_TAG_WILDCARD;
+	rs_srp->sh_var = SG_SHR_NONE;
+	sg_rq_chg_state_force(rs_srp, SG_RQ_INACTIVE);
+	atomic_inc(&rs_srp->parentfp->inactives);
+	rs_srp->frq_bm[0] &= (1 << SG_FRQ_RESERVED);
+	rs_srp->in_resid = 0;
+	rs_srp->rq_info = 0;
+	rs_srp->sense_len = 0;
+	rs_srp->sh_srp = NULL;
 	return err;
 }
 
@@ -3985,7 +4052,7 @@ fini:
 /*
  * After checking the proposed file share relationship is unique and
  * valid, sets up pointers between read-side and write-side sg_fd objects.
- * Return 0 on success or negated errno value.
+ * Allows previous write-side to be the same as the new new_ws_fd .
  */
 static int
 sg_fd_reshare(struct sg_fd *rs_sfp, int new_ws_fd)
@@ -4003,15 +4070,21 @@ sg_fd_reshare(struct sg_fd *rs_sfp, int new_ws_fd)
 		return -EBADF;
 	if (unlikely(!xa_get_mark(&rs_sfp->parentdp->sfp_arr, rs_sfp->idx,
 				  SG_XA_FD_RS_SHARE)))
-		return -EINVAL;
-	/* SG_XA_FD_RS_SHARE set impiles ws_sfp is valid */
+		res = -EINVAL;	/* invalid unless prev_sl==new_sl */
 
 	/* Alternate approach: fcheck_files(current->files, m_fd) */
 	filp = fget(new_ws_fd);
 	if (unlikely(!filp))
 		return -ENOENT;
-	if (unlikely(rs_sfp->filp == filp)) {/* share with self is confusing */
-		res = -ELOOP;
+	if (unlikely(rs_sfp->filp == filp)) {
+		res = -ELOOP;	/* share with self is confusing */
+		goto fini;
+	}
+	if (res == -EINVAL) {
+		if (ws_sfp && ws_sfp->filp == filp) {
+			found = true;
+			res = 0;	/* prev_sl==new_sl is okay */
+		}	/* else it is invalid and res is still -EINVAL */
 		goto fini;
 	}
 	SG_LOG(6, ws_sfp, "%s: write-side fd ok, scan for filp=0x%pK\n", __func__,
@@ -4021,7 +4094,7 @@ sg_fd_reshare(struct sg_fd *rs_sfp, int new_ws_fd)
 	if (!IS_ERR(ws_sfp))
 		found = !!ws_sfp;
 fini:
-	/* paired with filp=fget(new_ws_fd) above */
+	/* fput() paired with filp=fget(new_ws_fd) above */
 	fput(filp);
 	if (unlikely(res))
 		return res;
@@ -5661,9 +5734,10 @@ sg_mk_kern_bio(int bvec_cnt)
 static int
 sg_rq_map_kern(struct sg_request *srp, struct request_queue *q, struct request *rqq, int rw_ind)
 {
-	struct sg_scatter_hold *schp = &srp->sgat_h;
+	struct sg_scatter_hold *schp = srp->sgatp;
 	struct bio *bio;
-	int k, ln;
+	bool have_bio = false;
+	int k, ln, nr_segs;
 	int op_flags = 0;
 	int num_sgat = schp->num_sgat;
 	int dlen = schp->dlen;
@@ -5672,14 +5746,52 @@ sg_rq_map_kern(struct sg_request *srp, struct request_queue *q, struct request *
 	SG_LOG(4, srp->parentfp, "%s: dlen=%d, pg_sz=%d\n", __func__, dlen, pg_sz);
 	if (num_sgat <= 0)
 		return 0;
-	if (rw_ind == WRITE)
+	nr_segs = num_sgat;
+	k = 0;		/* N.B. following condition may increase k */
+	if (rw_ind == WRITE) {
 		op_flags = REQ_SYNC | REQ_IDLE;
-	bio = sg_mk_kern_bio(num_sgat);
-	if (!bio)
-		return -ENOMEM;
-	bio->bi_opf = req_op(rqq) | op_flags;
+		if (unlikely(srp->rq_flags & SGV4_FLAG_DOUT_OFFSET) &&
+		    test_bit(SG_FRQ_IS_V4I, srp->frq_bm)) {
+			struct sg_slice_hdr4 *slh4p = &srp->s_hdr4;
 
-	for (k = 0; k < num_sgat && dlen > 0; ++k, dlen -= ln) {
+			u32 wr_len = slh4p->wr_len;
+			u32 wr_off = slh4p->wr_offset;
+
+			if (wr_off > 0) {  /* skip over wr_off, conditionally add partial page */
+				for (ln = 0; k < num_sgat && wr_off > 0; ++k, wr_off -= ln)
+					ln = min_t(int, wr_off, pg_sz);
+				bio = sg_mk_kern_bio(num_sgat + 1 - k);
+				if (!bio)
+					return -ENOMEM;
+				bio->bi_opf = req_op(rqq) | op_flags;
+				have_bio = true;
+				if (ln < pg_sz) {	/* k > 0 since num_sgat > 0 */
+					int rlen = pg_sz - ln;
+					struct page *pg = schp->pages[k - 1];
+
+					if (bio_add_pc_page(q, bio, pg, rlen, ln) < rlen) {
+						bio_put(bio);
+						return -EINVAL;
+					}
+					wr_len -= pg_sz - ln;
+				}
+				dlen = wr_len;
+				SG_LOG(5, srp->parentfp, "%s:   wr_off=%u wr_len=%u\n", __func__,
+				       wr_off, wr_len);
+			} else {
+				if (wr_len < dlen)
+					dlen = wr_len;	/* short write, offset 0 */
+			}
+			nr_segs = num_sgat - k;
+		}
+	}
+	if (!have_bio) {
+		bio = sg_mk_kern_bio(nr_segs);
+		if (!bio)
+			return -ENOMEM;
+		bio->bi_opf = req_op(rqq) | op_flags;
+	}
+	for ( ; k < num_sgat && dlen > 0; ++k, dlen -= ln) {
 		ln = min_t(int, dlen, pg_sz);
 		if (bio_add_pc_page(q, bio, schp->pages[k], ln, 0) < ln) {
 			bio_put(bio);
@@ -5687,7 +5799,7 @@ sg_rq_map_kern(struct sg_request *srp, struct request_queue *q, struct request *
 		}
 	}
 	/* used blk_rq_append_bio() before but this is simpler */
-	blk_rq_bio_prep(rqq, bio, num_sgat);
+	blk_rq_bio_prep(rqq, bio, nr_segs);
 	rqq->nr_phys_segments = (1 << schp->page_order) * num_sgat;
 	return 0;
 }
@@ -6364,23 +6476,23 @@ sg_build_reserve(struct sg_fd *sfp, int buflen)
 }
 
 static struct sg_request *
-sg_setup_req_ws_helper(struct sg_fd *fp, int rsv_idx)
+sg_setup_req_ws_helper(struct sg_comm_wr_t *cwrp)
 {
 	int res;
 	struct sg_request *r_srp;
 	enum sg_rq_state rs_sr_st;
+	struct sg_fd *fp = cwrp->sfp;
 	struct sg_fd *rs_sfp = sg_fd_share_ptr(fp);
 
 	if (unlikely(!rs_sfp))
 		return ERR_PTR(-EPROTO);
 	/*
-	 * There may be contention with another potential write-side trying
-	 * to pair with this read-side. The loser will receive an
-	 * EADDRINUSE errno. The winner advances read-side's rq_state:
-	 *     SG_RQ_SHR_SWAP --> SG_RQ_SHR_IN_WS
+	 * There may be contention with another potential write-side trying to pair with this
+	 * read-side. The loser will receive an EADDRINUSE errno. The winner advances read-side's
+	 * rq_state:	SG_RQ_SHR_SWAP --> SG_RQ_SHR_IN_WS
 	 */
-	if (rsv_idx >= 0)
-		r_srp = rs_sfp->rsv_arr[rsv_idx];
+	if (cwrp->rsv_idx >= 0)
+		r_srp = rs_sfp->rsv_arr[cwrp->rsv_idx];
 	else
 		r_srp = sg_get_probable_read_side(rs_sfp);
 	if (unlikely(!r_srp))
@@ -6471,13 +6583,14 @@ sg_setup_req(struct sg_comm_wr_t *cwrp, enum sg_shr_var sh_var, int dxfr_len)
 		goto good_fini;
 	case SG_SHR_WS_RQ:
 		cp = "rs_rq";
-		rs_rsv_srp = sg_setup_req_ws_helper(fp, cwrp->rsv_idx);
+		rs_rsv_srp = sg_setup_req_ws_helper(cwrp);
 		if (IS_ERR(rs_rsv_srp)) {
 			r_srp = rs_rsv_srp;
 			goto err_out;
 		}
 		/* write-side dlen may be <= read-side's dlen */
-		if (unlikely(dxfr_len > rs_rsv_srp->sgatp->dlen)) {
+		if (unlikely(dxfr_len + cwrp->wr_offset >
+			     rs_rsv_srp->sgatp->dlen)) {
 			SG_LOG(1, fp, "%s: bad, write-side dlen [%d] > read-side's\n",
 			       __func__, dxfr_len);
 			r_srp = ERR_PTR(-E2BIG);
@@ -6522,6 +6635,7 @@ start_again:
 				if (r_srp->sgat_h.buflen <= SG_DEF_SECTOR_SZ) {
 					if (sg_rq_chg_state(r_srp, SG_RQ_INACTIVE, SG_RQ_BUSY))
 						continue;
+					atomic_dec(&fp->inactives);
 					mk_new_srp = false;
 					break;
 				} else if (!low_srp) {
