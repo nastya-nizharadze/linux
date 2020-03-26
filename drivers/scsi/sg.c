@@ -958,12 +958,12 @@ sg_submit_v3(struct sg_fd *sfp, struct sg_io_hdr *hp, bool sync,
 	return 0;
 }
 
-static void
-sg_sgv4_out_zero(struct sg_io_v4 *h4p)
+/* Clear from and including driver_status to end of sg_io_v4 object */
+static inline void
+sg_v4h_partial_zero(struct sg_io_v4 *h4p)
 {
-	const int off = offsetof(struct sg_io_v4, driver_status);
+	static const int off = offsetof(struct sg_io_v4, driver_status);
 
-	/* clear from and including driver_status to end of object */
 	memset((u8 *)h4p + off, 0, SZ_SG_IO_V4 - off);
 }
 
@@ -974,11 +974,13 @@ sg_sgv4_out_zero(struct sg_io_v4 *h4p)
  * secondary error value (s_res) is placed in the cop->spare_out field.
  */
 static int
-sg_mrq_arr_flush(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds, u32 tot_reqs,
-		 int s_res)
+sg_mrq_arr_flush(struct sg_mrq_hold *mhp)
 {
-	u32 sz = min(tot_reqs * SZ_SG_IO_V4, cop->din_xfer_len);
+	int s_res = mhp->s_res;
+	struct sg_io_v4 *cop = mhp->cwrp->h4p;
 	void __user *p = uptr64(cop->din_xferp);
+	struct sg_io_v4 *a_hds = mhp->a_hds;
+	u32 sz = min(mhp->tot_reqs * SZ_SG_IO_V4, cop->din_xfer_len);
 
 	if (unlikely(s_res))
 		cop->spare_out = -s_res;
@@ -992,11 +994,13 @@ sg_mrq_arr_flush(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds, u32 tot_reqs,
 }
 
 static int
-sg_mrq_1complet(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
-		struct sg_fd *do_on_sfp, int tot_reqs, struct sg_request *srp)
+sg_mrq_1complet(struct sg_mrq_hold *mhp, struct sg_fd *do_on_sfp,
+		struct sg_request *srp)
 {
 	int s_res, indx;
+	int tot_reqs = mhp->tot_reqs;
 	struct sg_io_v4 *hp;
+	struct sg_io_v4 *a_hds = mhp->a_hds;
 
 	if (unlikely(!srp))
 		return -EPROTO;
@@ -1016,7 +1020,7 @@ sg_mrq_1complet(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
 		return s_res;
 	hp->info |= SG_INFO_MRQ_FINI;
 	if (do_on_sfp->async_qp && (hp->flags & SGV4_FLAG_SIGNAL)) {
-		s_res = sg_mrq_arr_flush(cop, a_hds, tot_reqs, s_res);
+		s_res = sg_mrq_arr_flush(mhp);
 		if (unlikely(s_res))	/* can only be -EFAULT */
 			return s_res;
 		kill_fasync(&do_on_sfp->async_qp, SIGPOLL, POLL_IN);
@@ -1041,13 +1045,13 @@ sg_wait_mrq_event(struct sg_fd *sfp, struct sg_request **srpp)
  * Increments cop->info for each successful completion.
  */
 static int
-sg_mrq_complets(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
-		struct sg_fd *sfp, struct sg_fd *sec_sfp, int tot_reqs,
-		int mreqs, int sec_reqs)
+sg_mrq_complets(struct sg_mrq_hold *mhp, struct sg_fd *sfp,
+		struct sg_fd *sec_sfp, int mreqs, int sec_reqs)
 {
 	int res = 0;
 	int rres;
 	struct sg_request *srp;
+	struct sg_io_v4 *cop = mhp->cwrp->h4p;
 
 	SG_LOG(3, sfp, "%s: mreqs=%d, sec_reqs=%d\n", __func__, mreqs,
 	       sec_reqs);
@@ -1060,7 +1064,7 @@ sg_mrq_complets(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
 				break;
 			}
 			--mreqs;
-			res = sg_mrq_1complet(cop, a_hds, sfp, tot_reqs, srp);
+			res = sg_mrq_1complet(mhp, sfp, srp);
 			if (unlikely(res))
 				return res;
 			++cop->info;
@@ -1075,8 +1079,7 @@ sg_mrq_complets(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
 				break;
 			}
 			--sec_reqs;
-			rres = sg_mrq_1complet(cop, a_hds, sec_sfp, tot_reqs,
-					       srp);
+			rres = sg_mrq_1complet(mhp, sec_sfp, srp);
 			if (unlikely(rres))
 				return rres;
 			++cop->info;
@@ -1093,8 +1096,7 @@ sg_mrq_complets(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
 				mreqs = 0;
 			} else {
 				--mreqs;
-				res = sg_mrq_1complet(cop, a_hds, sfp,
-						      tot_reqs, srp);
+				res = sg_mrq_1complet(mhp, sfp, srp);
 				if (unlikely(res))
 					return res;
 				++cop->info;
@@ -1110,8 +1112,7 @@ sg_mrq_complets(struct sg_io_v4 *cop, struct sg_io_v4 *a_hds,
 				sec_reqs = 0;
 			} else {
 				--sec_reqs;
-				res = sg_mrq_1complet(cop, a_hds, sec_sfp,
-						      tot_reqs, srp);
+				res = sg_mrq_1complet(mhp, sec_sfp, srp);
 				if (unlikely(res))
 					return res;
 				++cop->info;
@@ -1142,7 +1143,7 @@ sg_mrq_sanity(struct sg_device *sdp, struct sg_io_v4 *cop,
 	/* Pre-check each request for anomalies, plus some preparation */
 	for (k = 0, hp = a_hds; k < tot_reqs; ++k, ++hp) {
 		flags = hp->flags;
-		sg_sgv4_out_zero(hp);
+		sg_v4h_partial_zero(hp);
 		if (unlikely(hp->guard != 'Q' || hp->protocol != 0 ||
 			     hp->subprotocol != 0)) {
 			SG_LOG(1, sfp, "%s: req index %u: %s or protocol\n",
@@ -1358,8 +1359,7 @@ sg_process_most_mrq(struct sg_fd *fp, struct sg_fd *o_sfp,
 			break;	/* cop->driver_status <-- 0 in this case */
 		}
 		if (rq_sfp->async_qp && (hp->flags & SGV4_FLAG_SIGNAL)) {
-			res = sg_mrq_arr_flush(cop, mhp->a_hds, mhp->tot_reqs,
-					       mhp->s_res);
+			res = sg_mrq_arr_flush(mhp);
 			if (unlikely(res))
 				break;
 			kill_fasync(&rq_sfp->async_qp, SIGPOLL, POLL_IN);
@@ -1375,8 +1375,7 @@ sg_process_most_mrq(struct sg_fd *fp, struct sg_fd *o_sfp,
 	if (mhp->immed)
 		return res;
 	if (likely(res == 0 && (this_fp_sent + other_fp_sent) > 0)) {
-		mhp->s_res = sg_mrq_complets(cop, mhp->a_hds, fp, o_sfp,
-					     mhp->tot_reqs, this_fp_sent,
+		mhp->s_res = sg_mrq_complets(mhp, fp, o_sfp, this_fp_sent,
 					     other_fp_sent);
 		if (unlikely(mhp->s_res == -EFAULT ||
 			     mhp->s_res == -ERESTARTSYS))
@@ -1511,8 +1510,7 @@ other_found:
 					break;
 				}
 				--other_fp_sent;
-				res = sg_mrq_1complet(cop, a_hds, o_sfp,
-						      mhp->tot_reqs, srp);
+				res = sg_mrq_1complet(mhp, o_sfp, srp);
 				if (unlikely(res))
 					return res;
 				++cop->info;
@@ -1528,8 +1526,7 @@ this_found:
 					break;
 				}
 				--this_fp_sent;
-				res = sg_mrq_1complet(cop, a_hds, fp,
-						      mhp->tot_reqs, srp);
+				res = sg_mrq_1complet(mhp, fp, srp);
 				if (unlikely(res))
 					return res;
 				++cop->info;
@@ -1716,7 +1713,7 @@ sg_do_multi_req(struct sg_comm_wr_t *cwrp, bool blocking)
 		mhp->immed = true;
 	SG_LOG(3, fp, "%s: %s, tot_reqs=%u, id_of_mrq=%d\n", __func__,
 	       mrq_name, tot_reqs, mhp->id_of_mrq);
-	sg_sgv4_out_zero(cop);
+	sg_v4h_partial_zero(cop);
 
 	if (unlikely(tot_reqs > U16_MAX)) {
 		return -ERANGE;
@@ -1800,7 +1797,7 @@ sg_do_multi_req(struct sg_comm_wr_t *cwrp, bool blocking)
 	}
 fini:
 	if (likely(res == 0) && !mhp->immed)
-		res = sg_mrq_arr_flush(cop, a_hds, tot_reqs, mhp->s_res);
+		res = sg_mrq_arr_flush(mhp);
 	kfree(cdb_ap);
 	kfree(a_hds);
 	return res;
@@ -2719,7 +2716,7 @@ sg_mrq_ioreceive(struct sg_fd *sfp, struct sg_io_v4 *cop, void __user *p,
 	if (unlikely(!rsp_v4_arr))
 		return -ENOMEM;
 
-	sg_sgv4_out_zero(cop);
+	sg_v4h_partial_zero(cop);
 	cop->din_resid = n;
 	res = sg_mrq_iorec_complets(sfp, non_block, n, rsp_v4_arr);
 	if (unlikely(res < 0))
