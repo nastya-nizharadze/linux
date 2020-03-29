@@ -46,6 +46,7 @@ static char *sg_version_date = "20210522";
 #include <linux/timekeeping.h>
 #include <linux/proc_fs.h>		/* used if CONFIG_SCSI_PROC_FS */
 #include <linux/xarray.h>
+#include <linux/eventfd.h>
 #include <linux/debugfs.h>
 
 #include <scsi/scsi.h>
@@ -293,6 +294,7 @@ struct sg_fd {		/* holds the state of a file descriptor */
 	struct file *filp;	/* my identity when sharing */
 	struct sg_fd __rcu *share_sfp;/* fd share cross-references, else NULL */
 	struct fasync_struct *async_qp; /* used by asynchronous notification */
+	struct eventfd_ctx *efd_ctxp;	/* eventfd context or NULL */
 	struct xarray srp_arr;	/* xarray of sg_request object pointers */
 	struct sg_request *rsv_arr[SG_MAX_RSV_REQS];
 	struct kref f_ref;
@@ -413,6 +415,7 @@ static void sg_take_snap(struct sg_fd *sfp, bool clear_first);
 #define SG_HAVE_EXCLUDE(sdp) test_bit(SG_FDEV_EXCLUDE, (sdp)->fdev_bm)
 #define SG_IS_O_NONBLOCK(sfp) (!!((sfp)->filp->f_flags & O_NONBLOCK))
 #define SG_RQ_ACTIVE(srp) (atomic_read(&(srp)->rq_st) != SG_RQ_INACTIVE)
+#define SG_IS_V4I(srp) test_bit(SG_FRQ_IS_V4I, (srp)->frq_bm)
 
 /*
  * Kernel needs to be built with CONFIG_SCSI_LOGGING to see log messages.
@@ -1099,7 +1102,7 @@ sg_mrq_arr_flush(struct sg_mrq_hold *mhp)
 }
 
 static int
-sg_mrq_1complet(struct sg_mrq_hold *mhp, struct sg_fd *do_on_sfp,
+sg_mrq_1complet(struct sg_mrq_hold *mhp, struct sg_fd *sfp,
 		struct sg_request *srp)
 {
 	int s_res, indx;
@@ -1110,30 +1113,37 @@ sg_mrq_1complet(struct sg_mrq_hold *mhp, struct sg_fd *do_on_sfp,
 	if (unlikely(!srp))
 		return -EPROTO;
 	indx = srp->s_hdr4.mrq_ind;
-	if (unlikely(srp->parentfp != do_on_sfp)) {
-		SG_LOG(1, do_on_sfp, "%s: mrq_ind=%d, sfp out-of-sync\n",
+	if (unlikely(srp->parentfp != sfp)) {
+		SG_LOG(1, sfp, "%s: mrq_ind=%d, sfp out-of-sync\n",
 		       __func__, indx);
 		return -EPROTO;
 	}
-	SG_LOG(3, do_on_sfp, "%s: mrq_ind=%d, pack_id=%d\n", __func__, indx,
+	SG_LOG(3, sfp, "%s: mrq_ind=%d, pack_id=%d\n", __func__, indx,
 	       srp->pack_id);
 	if (unlikely(indx < 0 || indx >= tot_reqs))
 		return -EPROTO;
 	hp = a_hds + indx;
-	s_res = sg_receive_v4(do_on_sfp, srp, NULL, hp);
+	s_res = sg_receive_v4(sfp, srp, NULL, hp);
 	if (unlikely(s_res == -EFAULT))
 		return s_res;
 	hp->info |= SG_INFO_MRQ_FINI;
 	if (mhp->co_mmap) {
 		sg_sgat_cp_into(mhp->co_mmap_sgatp, indx * SZ_SG_IO_V4,
 				(const u8 *)hp, SZ_SG_IO_V4);
-		if (do_on_sfp->async_qp && (hp->flags & SGV4_FLAG_SIGNAL))
-			kill_fasync(&do_on_sfp->async_qp, SIGPOLL, POLL_IN);
-	} else if (do_on_sfp->async_qp && (hp->flags & SGV4_FLAG_SIGNAL)) {
+		if (sfp->async_qp && (hp->flags & SGV4_FLAG_SIGNAL))
+			kill_fasync(&sfp->async_qp, SIGPOLL, POLL_IN);
+		if (sfp->efd_ctxp && (srp->rq_flags & SGV4_FLAG_EVENTFD)) {
+			u64 n = eventfd_signal(sfp->efd_ctxp, 1);
+
+			if (n != 1)
+				pr_info("%s: srp=%pK eventfd_signal problem\n",
+					__func__, srp);
+		}
+	} else if (sfp->async_qp && (hp->flags & SGV4_FLAG_SIGNAL)) {
 		s_res = sg_mrq_arr_flush(mhp);
 		if (unlikely(s_res))	/* can only be -EFAULT */
 			return s_res;
-		kill_fasync(&do_on_sfp->async_qp, SIGPOLL, POLL_IN);
+		kill_fasync(&sfp->async_qp, SIGPOLL, POLL_IN);
 	}
 	return 0;
 }
@@ -1475,6 +1485,14 @@ sg_process_most_mrq(struct sg_fd *fp, struct sg_fd *o_sfp,
 			if (rq_sfp->async_qp && (hp->flags & SGV4_FLAG_SIGNAL))
 				kill_fasync(&rq_sfp->async_qp, SIGPOLL,
 					    POLL_IN);
+			if (rq_sfp->efd_ctxp &&
+			    (srp->rq_flags & SGV4_FLAG_EVENTFD)) {
+				u64 n = eventfd_signal(rq_sfp->efd_ctxp, 1);
+
+				if (n != 1)
+					pr_info("%s: eventfd_signal prob\n",
+						__func__);
+			}
 		} else if (rq_sfp->async_qp &&
 			   (hp->flags & SGV4_FLAG_SIGNAL)) {
 			res = sg_mrq_arr_flush(mhp);
@@ -2685,6 +2703,34 @@ set_inactive:
 }
 
 static void
+sg_complete_shr_rs(struct sg_fd *sfp, struct sg_request *srp, bool other_err,
+		   enum sg_rq_state sr_st)
+{
+	int poll_type = POLL_OUT;
+	struct sg_fd *ws_sfp = sg_fd_share_ptr(sfp);
+
+	if (unlikely(!sg_result_is_good(srp->rq_result) || other_err)) {
+		set_bit(SG_FFD_READ_SIDE_ERR, sfp->ffd_bm);
+		sg_rq_chg_state_force(srp, SG_RQ_BUSY);
+		poll_type = POLL_HUP;   /* "Hang-UP flag */
+	} else if (sr_st != SG_RQ_SHR_SWAP) {
+		sg_rq_chg_state_force(srp, SG_RQ_SHR_SWAP);
+	}
+	if (ws_sfp && !srp->sh_srp) {
+		if (ws_sfp->async_qp &&
+		    (!SG_IS_V4I(srp) || (srp->rq_flags & SGV4_FLAG_SIGNAL)))
+			kill_fasync(&ws_sfp->async_qp, SIGPOLL, poll_type);
+		if (ws_sfp->efd_ctxp && (srp->rq_flags & SGV4_FLAG_EVENTFD)) {
+			u64 n = eventfd_signal(ws_sfp->efd_ctxp, 1);
+
+			if (n != 1)
+				pr_info("%s: srp=%pK eventfd prob\n",
+					__func__, srp);
+		}
+	}
+}
+
+static void
 sg_complete_v3v4(struct sg_fd *sfp, struct sg_request *srp, bool other_err)
 {
 	enum sg_rq_state sr_st = atomic_read(&srp->rq_st);
@@ -2694,25 +2740,7 @@ sg_complete_v3v4(struct sg_fd *sfp, struct sg_request *srp, bool other_err)
 	       sg_shr_str(srp->sh_var, true));
 	switch (srp->sh_var) {
 	case SG_SHR_RS_RQ:
-		{
-			int poll_type = POLL_OUT;
-			struct sg_fd *ws_sfp = sg_fd_share_ptr(sfp);
-
-			if (unlikely(!sg_result_is_good(srp->rq_result) ||
-				     other_err)) {
-				set_bit(SG_FFD_READ_SIDE_ERR, sfp->ffd_bm);
-				if (sr_st != SG_RQ_BUSY)
-					sg_rq_chg_state_force(srp, SG_RQ_BUSY);
-				poll_type = POLL_HUP;   /* "Hang-UP flag */
-			} else if (sr_st != SG_RQ_SHR_SWAP) {
-				sg_rq_chg_state_force(srp, SG_RQ_SHR_SWAP);
-			}
-			if (ws_sfp && ws_sfp->async_qp && !srp->sh_srp &&
-			    (!test_bit(SG_FRQ_IS_V4I, srp->frq_bm) ||
-			     (srp->rq_flags & SGV4_FLAG_SIGNAL)))
-				kill_fasync(&ws_sfp->async_qp, SIGPOLL,
-					    poll_type);
-		}
+		sg_complete_shr_rs(sfp, srp, other_err, sr_st);
 		break;
 	case SG_SHR_WS_RQ:	/* cleanup both on write-side completion */
 		if (likely(sg_fd_is_shared(sfp))) {
@@ -3662,8 +3690,8 @@ sg_fill_request_element(struct sg_fd *sfp, struct sg_request *srp,
 	rip->problem = !sg_result_is_good(srp->rq_result);
 	rip->pack_id = test_bit(SG_FFD_PREFER_TAG, sfp->ffd_bm) ?
 				srp->tag : srp->pack_id;
-	rip->usr_ptr = test_bit(SG_FRQ_IS_V4I, srp->frq_bm) ?
-			uptr64(srp->s_hdr4.usr_ptr) : srp->s_hdr3.usr_ptr;
+	rip->usr_ptr = SG_IS_V4I(srp) ? uptr64(srp->s_hdr4.usr_ptr)
+				      : srp->s_hdr3.usr_ptr;
 	xa_unlock_irqrestore(&sfp->srp_arr, iflags);
 }
 
@@ -3720,7 +3748,7 @@ skip_wait:
 #endif
 		return res;
 	}
-	if (test_bit(SG_FRQ_IS_V4I, srp->frq_bm))
+	if (SG_IS_V4I(srp))
 		res = sg_receive_v4(sfp, srp, p, h4p);
 	else
 		res = sg_receive_v3(sfp, srp, p);
@@ -4244,6 +4272,23 @@ fini:
 	return found ? 0 : -ENOTSOCK; /* ENOTSOCK for fd exists but not sg */
 }
 
+static int
+sg_eventfd_new(struct sg_fd *rs_sfp, int eventfd)
+		__must_hold(&rs_sfp->f_mutex)
+{
+	int ret = 0;
+
+	if (rs_sfp->efd_ctxp)
+		return -EBUSY;
+	rs_sfp->efd_ctxp = eventfd_ctx_fdget(eventfd);
+	if (IS_ERR(rs_sfp->efd_ctxp)) {
+		ret = PTR_ERR(rs_sfp->efd_ctxp);
+		rs_sfp->efd_ctxp = NULL;
+		return ret;
+	}
+	return ret;
+}
+
 /*
  * First normalize want_rsv_sz to be >= sfp->sgat_elem_sz and
  * <= max_segment_size. Exit if that is the same as old size; otherwise
@@ -4409,7 +4454,6 @@ sg_extended_bool_flags(struct sg_fd *sfp, struct sg_extended_info *seip)
 	const u32 c_flgs_rm = seip->ctl_flags_rd_mask;
 	const u32 c_flgs_val_in = seip->ctl_flags;
 	u32 c_flgs_val_out = c_flgs_val_in;
-	struct sg_fd *rs_sfp;
 	struct sg_device *sdp = sfp->parentdp;
 
 	/* TIME_IN_NS boolean, [raw] time in nanoseconds (def: millisecs) */
@@ -4489,7 +4533,8 @@ sg_extended_bool_flags(struct sg_fd *sfp, struct sg_extended_info *seip)
 	 * when written: 1 --> write-side doesn't want to continue
 	 */
 	if ((c_flgs_rm & SG_CTL_FLAGM_READ_SIDE_FINI) && sg_fd_is_shared(sfp)) {
-		rs_sfp = sg_fd_share_ptr(sfp);
+		struct sg_fd *rs_sfp = sg_fd_share_ptr(sfp);
+
 		if (rs_sfp && !IS_ERR_OR_NULL(rs_sfp->rsv_arr[0])) {
 			struct sg_request *res_srp = rs_sfp->rsv_arr[0];
 
@@ -4506,7 +4551,8 @@ sg_extended_bool_flags(struct sg_fd *sfp, struct sg_extended_info *seip)
 		res = sg_finish_rs_rq(sfp);
 	/* READ_SIDE_ERR boolean, [ro] share: read-side finished with error */
 	if (c_flgs_rm & SG_CTL_FLAGM_READ_SIDE_ERR) {
-		rs_sfp = sg_fd_share_ptr(sfp);
+		struct sg_fd *rs_sfp = sg_fd_share_ptr(sfp);
+
 		if (rs_sfp && test_bit(SG_FFD_READ_SIDE_ERR, rs_sfp->ffd_bm))
 			c_flgs_val_out |= SG_CTL_FLAGM_READ_SIDE_ERR;
 		else
@@ -4561,6 +4607,21 @@ sg_extended_bool_flags(struct sg_fd *sfp, struct sg_extended_info *seip)
 			c_flgs_val_out |= SG_CTL_FLAGM_SNAP_DEV;
 		else
 			c_flgs_val_out &= ~SG_CTL_FLAGM_SNAP_DEV;
+	}
+	/* RM_EVENTFD boolean, [rbw] */
+	if (c_flgs_rm & SG_CTL_FLAGM_RM_EVENTFD)
+		flg = !!sfp->efd_ctxp;
+	if ((c_flgs_wm & SG_CTL_FLAGM_RM_EVENTFD) && (c_flgs_val_in & SG_CTL_FLAGM_RM_EVENTFD)) {
+		if (sfp->efd_ctxp && atomic_read(&sfp->submitted) < 1) {
+			eventfd_ctx_put(sfp->efd_ctxp);
+			sfp->efd_ctxp = NULL;
+		}
+	}
+	if (c_flgs_rm & SG_CTL_FLAGM_RM_EVENTFD) {
+		if (flg)
+			c_flgs_val_out |= SG_CTL_FLAGM_RM_EVENTFD;
+		else
+			c_flgs_val_out &= ~SG_CTL_FLAGM_RM_EVENTFD;
 	}
 
 	if (c_flgs_val_in != c_flgs_val_out)
@@ -4714,6 +4775,15 @@ sg_ctl_extended(struct sg_fd *sfp, void __user *p)
 
 			seip->share_fd = sh_sfp ? sh_sfp->parentdp->index :
 						  U32_MAX;
+		}
+		mutex_unlock(&sfp->f_mutex);
+	}
+	if (or_masks & SG_SEIM_EVENTFD) {
+		mutex_lock(&sfp->f_mutex);
+		if (s_wr_mask & SG_SEIM_EVENTFD) {
+			result = sg_eventfd_new(sfp, (int)seip->share_fd);
+			if (ret == 0 && unlikely(result))
+				ret = result;
 		}
 		mutex_unlock(&sfp->f_mutex);
 	}
@@ -5458,7 +5528,7 @@ sg_rq_end_io(struct request *rqq, blk_status_t status)
 	a_resid = scsi_rp->resid_len;
 
 	if (unlikely(a_resid)) {
-		if (test_bit(SG_FRQ_IS_V4I, srp->frq_bm)) {
+		if (SG_IS_V4I(srp)) {
 			if (rq_data_dir(rqq) == READ)
 				srp->in_resid = a_resid;
 			else
@@ -5547,9 +5617,16 @@ sg_rq_end_io(struct request *rqq, blk_status_t status)
 	}
 	if (!(srp->rq_flags & SGV4_FLAG_HIPRI))
 		wake_up_interruptible(&sfp->cmpl_wait);
-	if (sfp->async_qp && (!test_bit(SG_FRQ_IS_V4I, srp->frq_bm) ||
+	if (sfp->async_qp && (!SG_IS_V4I(srp) ||
 			      (srp->rq_flags & SGV4_FLAG_SIGNAL)))
 		kill_fasync(&sfp->async_qp, SIGPOLL, POLL_IN);
+	if (sfp->efd_ctxp && (srp->rq_flags & SGV4_FLAG_EVENTFD)) {
+		u64 n = eventfd_signal(sfp->efd_ctxp, 1);
+
+		if (n != 1)
+			pr_info("%s: srp=%pK eventfd_signal problem\n",
+				__func__, srp);
+	}
 	kref_put(&sfp->f_ref, sg_remove_sfp);	/* get in: sg_execute_cmd() */
 }
 
@@ -5886,8 +5963,7 @@ sg_rq_map_kern(struct sg_request *srp, struct request_queue *q, struct request *
 	k = 0;		/* N.B. following condition may increase k */
 	if (rw_ind == WRITE) {
 		op_flags = REQ_SYNC | REQ_IDLE;
-		if (unlikely(srp->rq_flags & SGV4_FLAG_DOUT_OFFSET) &&
-		    test_bit(SG_FRQ_IS_V4I, srp->frq_bm)) {
+		if (unlikely(srp->rq_flags & SGV4_FLAG_DOUT_OFFSET) && SG_IS_V4I(srp)) {
 			struct sg_slice_hdr4 *slh4p = &srp->s_hdr4;
 
 			u32 wr_len = slh4p->wr_len;
@@ -5912,13 +5988,13 @@ sg_rq_map_kern(struct sg_request *srp, struct request_queue *q, struct request *
 					wr_len -= pg_sz - ln;
 				}
 				dlen = wr_len;
+				nr_segs = num_sgat - k;
 				SG_LOG(5, srp->parentfp, "%s:   wr_off=%u wr_len=%u\n", __func__,
 				       wr_off, wr_len);
 			} else {
 				if (wr_len < dlen)
 					dlen = wr_len;	/* short write, offset 0 */
 			}
-			nr_segs = num_sgat - k;
 		}
 	}
 	if (!have_bio) {
@@ -5970,7 +6046,7 @@ sg_start_req(struct sg_request *srp, struct sg_comm_wr_t *cwrp, int dxfer_dir)
 		}
 		SG_LOG(5, sfp, "%s: long_cmdp=0x%pK ++\n", __func__, long_cmdp);
 	}
-	if (likely(test_bit(SG_FRQ_IS_V4I, srp->frq_bm))) {
+	if (SG_IS_V4I(srp)) {
 		struct sg_io_v4 *h4p = cwrp->h4p;
 
 		if (dxfer_dir == SG_DXFER_TO_DEV) {
@@ -7160,6 +7236,8 @@ sg_uc_remove_sfp(struct work_struct *work)
 	if (subm != 0)
 		SG_LOG(1, sfp, "%s: expected submitted=0 got %d\n",
 		       __func__, subm);
+	if (sfp->efd_ctxp)
+		eventfd_ctx_put(sfp->efd_ctxp);
 	xa_destroy(xafp);
 	xadp = &sdp->sfp_arr;
 	xa_lock_irqsave(xadp, iflags);
@@ -7488,7 +7566,7 @@ sg_proc_debug_sreq(struct sg_request *srp, int to, bool t_in_ns, char *obp,
 
 	if (unlikely(len < 1))
 		return 0;
-	v4 = test_bit(SG_FRQ_IS_V4I, srp->frq_bm);
+	v4 = SG_IS_V4I(srp);
 	is_v3v4 = v4 ? true : (srp->s_hdr3.interface_id != '\0');
 	sg_get_rsv_str(srp, "     ", "", sizeof(b), b);
 	if (strlen(b) > 5)
