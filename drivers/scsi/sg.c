@@ -184,6 +184,7 @@ static int def_reserved_size = -1;	/* picks up init parameter */
 static int sg_allow_dio = SG_ALLOW_DIO_DEF;	/* ignored by code */
 
 static int scatter_elem_sz = SG_SCATTER_SZ;
+static bool no_attach_msg;
 
 #define SG_DEF_SECTOR_SZ 512
 
@@ -5878,8 +5879,9 @@ sg_add_device(struct device *cl_dev, struct class_interface *cl_intf)
 
 	sdp->create_ns = ktime_get_boottime_ns();
 	sg_calc_sgat_param(sdp);
-	sdev_printk(KERN_NOTICE, scsidp, "Attached scsi generic sg%d type %d\n", sdp->index,
-		    scsidp->type);
+	if (!no_attach_msg)
+		sdev_printk(KERN_NOTICE, scsidp, "Attached scsi generic sg%d type %d\n",
+			    sdp->index, scsidp->type);
 
 	dev_set_drvdata(cl_dev, sdp);
 	return 0;
@@ -8129,9 +8131,10 @@ static void sg_dfs_exit(void) {}
 
 #endif		/* CONFIG_DEBUG_FS */
 
-module_param_named(scatter_elem_sz, scatter_elem_sz, int, 0644);
-module_param_named(def_reserved_size, def_reserved_size, int, 0644);
 module_param_named(allow_dio, sg_allow_dio, int, 0644);
+module_param_named(def_reserved_size, def_reserved_size, int, 0644);
+module_param_named(no_attach_msg, no_attach_msg, bool, 0644);
+module_param_named(scatter_elem_sz, scatter_elem_sz, int, 0644);
 
 MODULE_AUTHOR("Douglas Gilbert");
 MODULE_DESCRIPTION("SCSI generic (sg) driver");
@@ -8139,8 +8142,9 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION(SG_VERSION_STR);
 MODULE_ALIAS_CHARDEV_MAJOR(SCSI_GENERIC_MAJOR);
 
-MODULE_PARM_DESC(scatter_elem_sz, "scatter gather element size (default: max(SG_SCATTER_SZ, PAGE_SIZE))");
-MODULE_PARM_DESC(def_reserved_size, "size of buffer reserved for each fd");
 MODULE_PARM_DESC(allow_dio, "allow direct I/O (default: 0 (disallow)); now ignored");
+MODULE_PARM_DESC(def_reserved_size, "size of buffer reserved for each fd");
+MODULE_PARM_DESC(no_attach_msg, "don't log sg device attach message when 1 (def:0)");
+MODULE_PARM_DESC(scatter_elem_sz, "scatter gather element size (only powers of 2 >= PAGE_SIZE)");
 module_init(init_sg);
 module_exit(exit_sg);
