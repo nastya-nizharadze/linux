@@ -128,6 +128,7 @@ typedef struct sg_io_hdr {
 #define SGV4_FLAG_KEEP_SHARE 0x20000  /* ... buffer for another dout command */
 #define SGV4_FLAG_MULTIPLE_REQS 0x40000	/* 1 or more sg_io_v4-s in data-in */
 #define SGV4_FLAG_ORDERED_WR 0x80000	/* svb: issue in-order writes */
+#define SGV4_FLAG_REC_ORDER 0x100000 /* receive order in v4:request_priority */
 
 /* Output (potentially OR-ed together) in v3::info or v4::info field */
 #define SG_INFO_OK_MASK 0x1

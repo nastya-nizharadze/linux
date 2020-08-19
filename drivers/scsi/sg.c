@@ -1553,8 +1553,11 @@ sg_mrq_sanity(struct sg_mrq_hold *mhp, bool is_svb)
 			hp->response = cop->response;
 			hp->max_response_len = cop->max_response_len;
 		}
-		if (!is_svb)
+		if (!is_svb) {
+			if (cop->flags & SGV4_FLAG_REC_ORDER)
+				hp->flags |= SGV4_FLAG_REC_ORDER;
 			continue;
+		}
 		/* mrq share variable blocking (svb) additional constraints checked here */
 		if (unlikely(flags & (SGV4_FLAG_COMPLETE_B4 | SGV4_FLAG_KEEP_SHARE))) {
 			SG_LOG(1, sfp, "%s: %s %u: no KEEP_SHARE with svb\n", __func__, rip, k);
@@ -2782,7 +2785,7 @@ sg_common_write(struct sg_comm_wr_t *cwrp)
 		srp->s_hdr4.cmd_len = h4p->request_len;
 		srp->s_hdr4.dir = dir;
 		srp->s_hdr4.out_resid = 0;
-		srp->s_hdr4.mrq_ind = 0;
+		srp->s_hdr4.mrq_ind = (rq_flags & SGV4_FLAG_REC_ORDER) ? h4p->request_priority : 0;
 		if (dir == SG_DXFER_TO_DEV) {
 			srp->s_hdr4.wr_offset = cwrp->wr_offset;
 			srp->s_hdr4.wr_len = dlen;
@@ -3060,7 +3063,7 @@ sg_receive_v4(struct sg_fd *sfp, struct sg_request *srp, void __user *p, struct 
 static int
 sg_mrq_iorec_complets(struct sg_fd *sfp, bool non_block, int max_mrqs, struct sg_io_v4 *rsp_arr)
 {
-	int k;
+	int k, idx;
 	int res = 0;
 	struct sg_request *srp;
 
@@ -3069,8 +3072,15 @@ sg_mrq_iorec_complets(struct sg_fd *sfp, bool non_block, int max_mrqs, struct sg
 		if (!sg_mrq_get_ready_srp(sfp, &srp))
 			break;
 		if (IS_ERR(srp))
-			return k ? k : PTR_ERR(srp);
-		res = sg_receive_v4(sfp, srp, NULL, rsp_arr + k);
+			return k ? k /* some but not all */ : PTR_ERR(srp);
+		if (srp->rq_flags & SGV4_FLAG_REC_ORDER) {
+			idx = srp->s_hdr4.mrq_ind;
+			if (idx >= max_mrqs)
+				idx = 0;	/* overwrite index 0 when trouble */
+		} else {
+			idx = k;	/* completion order */
+		}
+		res = sg_receive_v4(sfp, srp, NULL, rsp_arr + idx);
 		if (unlikely(res))
 			return res;
 		rsp_arr[k].info |= SG_INFO_MRQ_FINI;
@@ -3084,7 +3094,14 @@ sg_mrq_iorec_complets(struct sg_fd *sfp, bool non_block, int max_mrqs, struct sg
 			return res;	/* signal --> -ERESTARTSYS */
 		if (IS_ERR(srp))
 			return k ? k : PTR_ERR(srp);
-		res = sg_receive_v4(sfp, srp, NULL, rsp_arr + k);
+		if (srp->rq_flags & SGV4_FLAG_REC_ORDER) {
+			idx = srp->s_hdr4.mrq_ind;
+			if (idx >= max_mrqs)
+				idx = 0;
+		} else {
+			idx = k;
+		}
+		res = sg_receive_v4(sfp, srp, NULL, rsp_arr + idx);
 		if (unlikely(res))
 			return res;
 		rsp_arr[k].info |= SG_INFO_MRQ_FINI;
@@ -7558,7 +7575,8 @@ sg_proc_seq_show_devstrs(struct seq_file *s, void *v)
 
 /* Writes debug info for one sg_request in obp buffer */
 static int
-sg_proc_debug_sreq(struct sg_request *srp, int to, bool t_in_ns, bool inactive, char *obp, int len)
+sg_proc_debug_sreq(struct sg_request *srp, int to, bool t_in_ns, bool inactive, char *obp,
+		   int len)
 {
 	bool is_v3v4, v4, is_dur;
 	int n = 0;
@@ -7598,13 +7616,8 @@ sg_proc_debug_sreq(struct sg_request *srp, int to, bool t_in_ns, bool inactive, 
 		n += scnprintf(obp + n, len - n, " sgat=%d", srp->sgatp->num_sgat);
 	cp = (srp->rq_flags & SGV4_FLAG_HIPRI) ? "hipri " : "";
 	n += scnprintf(obp + n, len - n, " %sop=0x%02x\n", cp, srp->cmd_opcode);
-	if (inactive && rq_st != SG_RQ_INACTIVE) {
-		if (xa_get_mark(&srp->parentfp->srp_arr, srp->rq_idx, SG_XA_RQ_INACTIVE))
-			cp = "still marked inactive, BAD";
-		else
-			cp = "no longer marked inactive";
-		n += scnprintf(obp + n, len - n, "       <<< xarray %s >>>\n", cp);
-	}
+	if (inactive && rq_st != SG_RQ_INACTIVE)
+		n += scnprintf(obp + n, len - n, "       <<< inconsistent state >>>\n");
 	return n;
 }
 
@@ -7688,7 +7701,7 @@ sg_proc_debug_fd(struct sg_fd *fp, char *obp, int len, unsigned long idx, bool r
 			n += scnprintf(obp + n, len - n, "     rq_bm=0x%lx", srp->frq_bm[0]);
 		n += sg_proc_debug_sreq(srp, fp->timeout, t_in_ns, true, obp + n, len - n);
 		++k;
-		if ((k % 8) == 0) {	/* don't hold up isr_s too long */
+		if ((k % 8) == 0) {	/* don't hold up things too long */
 			xa_unlock_irqrestore(&fp->srp_arr, iflags);
 			cpu_relax();
 			xa_lock_irqsave(&fp->srp_arr, iflags);
