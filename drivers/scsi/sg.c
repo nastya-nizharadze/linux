@@ -1315,6 +1315,7 @@ skip_wait:
 	if (SG_IS_DETACHING(sdp))
 		goto detaching;
 	return sg_rq_chg_state(srp, SG_RQ_AWAIT_RCV, SG_RQ_BUSY);
+
 poll_loop:
 	if (srp->rq_flags & SGV4_FLAG_HIPRI) {
 		long state = current->state;
@@ -1368,37 +1369,34 @@ detaching:
 static struct sg_request *
 sg_mrq_poll_either(struct sg_fd *sfp, struct sg_fd *sec_sfp, bool *on_sfp)
 {
-	bool sig_pending = false;
 	long state = current->state;
 	struct sg_request *srp;
 
 	do {		/* alternating polling loop */
 		if (sfp) {
 			if (sg_mrq_get_ready_srp(sfp, &srp)) {
+				__set_current_state(TASK_RUNNING);
 				if (!srp)
 					return ERR_PTR(-ENODEV);
 				*on_sfp = true;
-				__set_current_state(TASK_RUNNING);
 				return srp;
 			}
 		}
 		if (sec_sfp && sfp != sec_sfp) {
 			if (sg_mrq_get_ready_srp(sec_sfp, &srp)) {
+				__set_current_state(TASK_RUNNING);
 				if (!srp)
 					return ERR_PTR(-ENODEV);
 				*on_sfp = false;
-				__set_current_state(TASK_RUNNING);
 				return srp;
 			}
 		}
 		if (signal_pending_state(state, current)) {
-			sig_pending = true;
-			break;
+			__set_current_state(TASK_RUNNING);
+			return ERR_PTR(-ERESTARTSYS);
 		}
 		cpu_relax();
-	} while (!need_resched());
-	__set_current_state(TASK_RUNNING);
-	return ERR_PTR(sig_pending ? -ERESTARTSYS : -EAGAIN);
+	} while (true);
 }
 
 /*
@@ -3061,21 +3059,25 @@ sg_receive_v4(struct sg_fd *sfp, struct sg_request *srp, void __user *p, struct 
  * of elements written to rsp_arr, which may be 0 if mrqs submitted but none waiting
  */
 static int
-sg_mrq_iorec_complets(struct sg_fd *sfp, bool non_block, int max_mrqs, struct sg_io_v4 *rsp_arr)
+sg_mrq_iorec_complets(struct sg_fd *sfp, bool non_block, int max_rcv, int num_rsp_arr,
+		      struct sg_io_v4 *rsp_arr)
 {
 	int k, idx;
 	int res = 0;
 	struct sg_request *srp;
 
-	SG_LOG(3, sfp, "%s: max_mrqs=%d\n", __func__, max_mrqs);
-	for (k = 0; k < max_mrqs; ++k) {
+	SG_LOG(3, sfp, "%s: num_rsp_arr=%d, max_rcv=%d", __func__, num_rsp_arr, max_rcv);
+	if (max_rcv == 0 || max_rcv > num_rsp_arr)
+		max_rcv = num_rsp_arr;
+	k = 0;
+	for ( ; k < max_rcv; ++k) {
 		if (!sg_mrq_get_ready_srp(sfp, &srp))
 			break;
 		if (IS_ERR(srp))
 			return k ? k /* some but not all */ : PTR_ERR(srp);
 		if (srp->rq_flags & SGV4_FLAG_REC_ORDER) {
 			idx = srp->s_hdr4.mrq_ind;
-			if (idx >= max_mrqs)
+			if (idx >= num_rsp_arr)
 				idx = 0;	/* overwrite index 0 when trouble */
 		} else {
 			idx = k;	/* completion order */
@@ -3083,12 +3085,12 @@ sg_mrq_iorec_complets(struct sg_fd *sfp, bool non_block, int max_mrqs, struct sg
 		res = sg_receive_v4(sfp, srp, NULL, rsp_arr + idx);
 		if (unlikely(res))
 			return res;
-		rsp_arr[k].info |= SG_INFO_MRQ_FINI;
+		rsp_arr[idx].info |= SG_INFO_MRQ_FINI;
 	}
-	if (non_block)
+	if (non_block || k >= max_rcv)
 		return k;
-
-	for ( ; k < max_mrqs; ++k) {
+	SG_LOG(6, sfp, "%s: received=%d, max=%d\n", __func__, k, max_rcv);
+	for ( ; k < max_rcv; ++k) {
 		res = sg_wait_any_mrq(sfp, &srp);
 		if (unlikely(res))
 			return res;	/* signal --> -ERESTARTSYS */
@@ -3096,7 +3098,7 @@ sg_mrq_iorec_complets(struct sg_fd *sfp, bool non_block, int max_mrqs, struct sg
 			return k ? k : PTR_ERR(srp);
 		if (srp->rq_flags & SGV4_FLAG_REC_ORDER) {
 			idx = srp->s_hdr4.mrq_ind;
-			if (idx >= max_mrqs)
+			if (idx >= num_rsp_arr)
 				idx = 0;
 		} else {
 			idx = k;
@@ -3118,6 +3120,7 @@ static int
 sg_mrq_ioreceive(struct sg_fd *sfp, struct sg_io_v4 *cop, void __user *p, bool non_block)
 {
 	int res = 0;
+	int max_rcv;
 	u32 len, n;
 	struct sg_io_v4 *rsp_v4_arr;
 	void __user *pp;
@@ -3130,14 +3133,16 @@ sg_mrq_ioreceive(struct sg_fd *sfp, struct sg_io_v4 *cop, void __user *p, bool n
 		return -ERANGE;
 	n /= SZ_SG_IO_V4;
 	len = n * SZ_SG_IO_V4;
-	SG_LOG(3, sfp, "%s: %s, num_reqs=%u\n", __func__, (non_block ? "IMMED" : "blocking"), n);
+	max_rcv = cop->din_iovec_count;
+	SG_LOG(3, sfp, "%s: %s, num_reqs=%u, max_rcv=%d\n", __func__,
+	       (non_block ? "IMMED" : "blocking"), n, max_rcv);
 	rsp_v4_arr = kcalloc(n, SZ_SG_IO_V4, GFP_KERNEL);
 	if (unlikely(!rsp_v4_arr))
 		return -ENOMEM;
 
 	sg_v4h_partial_zero(cop);
 	cop->din_resid = n;
-	res = sg_mrq_iorec_complets(sfp, non_block, n, rsp_v4_arr);
+	res = sg_mrq_iorec_complets(sfp, non_block, max_rcv, n, rsp_v4_arr);
 	if (unlikely(res < 0))
 		goto fini;
 	cop->din_resid -= res;
@@ -3171,7 +3176,6 @@ sg_wait_poll_by_id(struct sg_fd *sfp, struct sg_request **srpp, int id,
 	return __wait_event_interruptible(sfp->cmpl_wait, sg_get_ready_srp(sfp, srpp, id, is_tag));
 poll_loop:
 	{
-		bool sig_pending = false;
 		long state = current->state;
 		struct sg_request *srp;
 
@@ -3182,14 +3186,16 @@ poll_loop:
 				*srpp = srp;
 				return 0;
 			}
+			if (SG_IS_DETACHING(sfp->parentdp)) {
+				__set_current_state(TASK_RUNNING);
+				return -ENODEV;
+			}
 			if (signal_pending_state(state, current)) {
-				sig_pending = true;
-				break;
+				__set_current_state(TASK_RUNNING);
+				return -ERESTARTSYS;
 			}
 			cpu_relax();
-		} while (!need_resched());
-		__set_current_state(TASK_RUNNING);
-		return sig_pending ? -ERESTARTSYS : -EAGAIN;
+		} while (true);
 	}
 }
 
