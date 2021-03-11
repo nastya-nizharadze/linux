@@ -50,6 +50,7 @@ static char *sg_version_date = "20210125";
 #include <linux/debugfs.h>
 
 #include <scsi/scsi.h>
+#include <scsi/scsi_cmnd.h>
 #include <scsi/scsi_eh.h>
 #include <scsi/scsi_dbg.h>
 #include <scsi/scsi_host.h>
@@ -393,8 +394,10 @@ static struct sg_fd *sg_add_sfp(struct sg_device *sdp, struct file *filp);
 static void sg_remove_sfp(struct kref *);
 static void sg_remove_sfp_share(struct sg_fd *sfp, bool is_rd_side);
 static struct sg_request *sg_find_srp_by_id(struct sg_fd *sfp, int id, bool is_tag);
+static struct sg_request *sg_find_srp_by_tag_any_mark(struct sg_fd *sfp, int tag);
 static struct sg_request *sg_setup_req(struct sg_comm_wr_t *cwrp, enum sg_shr_var sh_var);
 static void sg_deact_request(struct sg_fd *sfp, struct sg_request *srp);
+static void sg_deact_request_ulck(struct sg_fd *sfp, struct sg_request *srp);
 static struct sg_device *sg_get_dev(int min_dev);
 static void sg_device_destroy(struct kref *kref);
 static struct sg_request *sg_mk_srp_sgat(struct sg_fd *sfp, bool first, int db_len);
@@ -403,8 +406,10 @@ static int sg_rq_chg_state(struct sg_request *srp, enum sg_rq_state old_st,
 			   enum sg_rq_state new_st);
 static int sg_finish_read_side_rq(struct sg_fd *sfp, struct sg_request *rs_srp);
 static void sg_rq_chg_state_force(struct sg_request *srp, enum sg_rq_state new_st);
+static void sg_rq_chg_state_force_ulck(struct sg_request *srp, enum sg_rq_state new_st);
 static int sg_sfp_blk_poll(struct sg_fd *sfp, int loop_count);
 static int sg_srp_blk_poll(struct sg_request *srp, int loop_count);
+static int sg_send_tmf(struct sg_fd *sfp, struct sg_io_v4 *h4p);
 
 #if IS_ENABLED(CONFIG_SCSI_LOGGING) && IS_ENABLED(SG_DEBUG)
 static const char *sg_rq_st_str(enum sg_rq_state rq_st, bool long_str);
@@ -2274,6 +2279,8 @@ fini:
 	return res;
 }
 
+// #include <scsi/scsi_cmnd.h>
+
 static int
 sg_submit_v4(struct sg_fd *sfp, void __user *p, struct sg_io_v4 *h4p, bool from_sg_io,
 	     struct sg_request **o_srp)
@@ -2284,6 +2291,11 @@ sg_submit_v4(struct sg_fd *sfp, void __user *p, struct sg_io_v4 *h4p, bool from_
 	struct sg_request *srp;
 	struct sg_comm_wr_t cwr;
 
+	if (h4p->subprotocol == 1) {
+		SG_LOG(6, sfp, "%s: send TMF\n", __func__);
+		res = sg_send_tmf(sfp, h4p);
+		return res;
+	}
 	sg_comm_wr_init(&cwr);
 	dlen = h4p->din_xfer_len ? h4p->din_xfer_len : h4p->dout_xfer_len;
 	cwr.dlen = dlen;
@@ -2347,6 +2359,7 @@ sg_ctl_iosubmit(struct sg_fd *sfp, void __user *p)
 	struct sg_io_v4 *h4p = &h4;
 	struct sg_device *sdp = sfp->parentdp;
 
+	SG_LOG(6, sfp, "%s: h4p->guard == %c\n", __func__, (char)h4p->guard);
 	res = sg_allow_if_err_recovery(sdp, SG_IS_O_NONBLOCK(sfp));
 	if (unlikely(res))
 		return res;
@@ -2354,6 +2367,7 @@ sg_ctl_iosubmit(struct sg_fd *sfp, void __user *p)
 		return -EFAULT;
 	if (likely(h4p->guard == 'Q'))
 		return sg_submit_v4(sfp, p, h4p, false, NULL);
+	SG_LOG(6, sfp, "%s: Should not be here!!!\n", __func__);
 	return -EPERM;
 }
 
@@ -2704,6 +2718,87 @@ sg_get_rsv_str_lck(struct sg_request *srp, const char *leadin, const char *leado
 	cp = sg_get_rsv_str(srp, leadin, leadout, b_len, b);
 	xa_unlock_irqrestore(&srp->parentfp->srp_arr, iflags);
 	return cp;
+}
+
+static int
+sg_send_tmf(struct sg_fd *sfp, struct sg_io_v4 *h4p)
+{
+	int res = 0;
+	struct sg_request *srp;
+	unsigned long iflags;
+	struct request *rqq;
+	int type = *(uint8_t *)h4p->request;
+	enum sg_rq_state rq_st;
+	struct scsi_device *dev;
+
+	switch (type) {
+		case SCSI_TMF_TASK_ABORT:
+			if (h4p->request_tag <= 0) {	/* Should add check for tag only */
+				SG_LOG(6, sfp, "%s: Bad tag: %lld\n", __func__, h4p->request_tag);
+				return -EINVAL;
+			}
+			if (!mutex_trylock(&sfp->f_mutex))
+				return -EAGAIN;
+			dev = sfp->parentdp->device;
+			xa_lock_irqsave(&sfp->srp_arr, iflags);
+
+			srp = sg_find_srp_by_tag_any_mark(sfp, h4p->request_tag); //search not from 0 but from last command
+			 if (!srp) {
+				SG_LOG(6, sfp, "%s: cannot find srp\n", __func__);
+				res = -ENODATA;
+				goto out_irq;
+			}
+			rq_st = atomic_read_acquire(&srp->rq_st);
+			switch (rq_st) {
+				case SG_RQ_INFLIGHT:
+					break;
+				case SG_RQ_BUSY:
+					res = -EBUSY;
+					goto out_irq;
+				case SG_RQ_INACTIVE:
+				case SG_RQ_AWAIT_RCV:
+				default:
+					goto out_irq;
+			}
+			sg_rq_chg_state_force_ulck(srp, SG_RQ_BUSY);
+
+			if (test_and_set_bit(SG_FRQ_PC_ABORTING, srp->frq_pc_bm)) {
+				SG_LOG(1, sfp, "%s: already aborting req\n", __func__);
+				goto out_irq;
+			}
+
+			xa_unlock_irqrestore(&sfp->srp_arr, iflags);
+
+			rqq = READ_ONCE(srp->rqq);
+			if (!rqq) {
+				SG_LOG(6, sfp, "%s: cannot find rqq\n", __func__);
+				res = -ENODATA;
+				goto out_abort;
+			}
+			rqq->cmd_flags |= REQ_FAILFAST_DEV;
+			res = scsi_send_tmf(dev, rqq, SCSI_TMF_TASK_ABORT);
+			SG_LOG(6, sfp, "%s: res == %d\n", __func__, res);
+
+			//if (res == SUCCESS) {
+				//srp->rqq = NULL;??
+				//sg_finish_scsi_blk_rq(srp);
+				//sg_deact_request(sfp, srp);
+				//kref_put(&sfp->f_ref, sg_remove_sfp);	get in: sg_execute_cmd() как понять что мы в end_io
+			//} else {
+			sg_rq_chg_state_force(srp, rq_st);
+			//}
+			goto out_mutex;
+		default:
+			return -EINVAL;
+	}
+out_abort:
+	xa_lock_irqsave(&sfp->srp_arr, iflags);
+	clear_bit(SG_FRQ_PC_ABORTING, srp->frq_pc_bm);
+out_irq:
+	xa_unlock_irqrestore(&sfp->srp_arr, iflags);
+out_mutex:
+	mutex_unlock(&sfp->f_mutex);
+	return res;
 }
 
 static void
@@ -5783,6 +5878,8 @@ sg_rq_end_io(struct request *rqq, blk_status_t status)
 	struct scsi_request *scsi_rp = scsi_req(rqq);
 	struct sg_device *sdp;
 	struct sg_fd *sfp;
+	struct scsi_cmnd scmd = blk_mq_rq_to_pdu(rqq);
+	bool is_failed = false;
 
 	sfp = srp->parentfp;
 	sdp = sfp->parentdp;
@@ -5800,6 +5897,14 @@ sg_rq_end_io(struct request *rqq, blk_status_t status)
 				srp->s_hdr4.out_resid = a_resid;
 		} else {
 			srp->in_resid = a_resid;
+		}
+	}
+	if (scmd && unlikely(test_bit(SG_FRQ_PC_ABORTING, srp->frq_pc_bm))) {
+		if (scmd->tmf_status == SUCCESS) {
+			srp->rq_info |= SG_INFO_SUCCESS;
+		} else if (scmd->tmf_status == FAILED) {
+			is_failed = true;
+			srp->rq_info |= SG_INFO_FAILED;
 		}
 	}
 	if (unlikely(test_bit(SG_FRQ_PC_ABORTING, srp->frq_pc_bm)) && sg_result_is_good(rq_result))
@@ -5865,8 +5970,10 @@ sg_rq_end_io(struct request *rqq, blk_status_t status)
 	 * Free the mid-level resources apart from the bio (if any). The bio's blk_rq_unmap_user()
 	 * can be called later from user context.
 	 */
-	scsi_req_free_cmd(scsi_rp);
-	blk_put_request(rqq);
+	if (!is_failed) {
+		scsi_req_free_cmd(scsi_rp);
+		blk_put_request(rqq);
+	}
 
 	if (unlikely(rqq_state != SG_RQ_AWAIT_RCV)) {
 		/* clean up orphaned request that aren't being kept */
@@ -6338,8 +6445,10 @@ sg_start_req(struct sg_request *srp, struct sg_comm_wr_t *cwrp, int dxfer_dir)
 	/* current sg_request protected by SG_RQ_BUSY state */
 	scsi_rp = scsi_req(rqq);
 	WRITE_ONCE(srp->rqq, rqq);
-	if (rq_flags & SGV4_FLAG_YIELD_TAG)
+	if (rq_flags & SGV4_FLAG_YIELD_TAG) {
 		srp->tag = rqq->tag;
+		SG_LOG(4, sfp, "%s: tag=%d\n", __func__, srp->tag);
+	}
 	if (rq_flags & SGV4_FLAG_HIPRI)
 		set_bit(SG_FFD_HIPRI_SEEN, sfp->ffd_bm);
 	if (cwrp->cmd_len > BLK_MAX_CDB) {
@@ -6771,6 +6880,21 @@ good:
 	SG_LOG(5, sfp, "%s: %s%d found [srp=0x%pK]\n", __func__, (is_tag ? "tag=" : "pack_id="),
 	       id, srp);
 	return srp;
+}
+
+static struct sg_request *
+sg_find_srp_by_tag_any_mark(struct sg_fd *sfp, int tag)
+{ // search from low_used_idx!!!!!
+	unsigned long idx = 0;
+	struct sg_request *srp = NULL;
+	struct xarray *xafp = &sfp->srp_arr;
+
+	xa_for_each(xafp, idx, srp) {
+		if (srp->tag != tag)
+			continue;
+		return srp;
+	}
+	return NULL;
 }
 
 /*
@@ -7252,6 +7376,32 @@ sg_deact_request(struct sg_fd *sfp, struct sg_request *srp)
 	if (sr_st != SG_RQ_SHR_SWAP) {
 		/* Called from many contexts, don't know whether xa locks held. So assume not. */
 		sg_rq_chg_state_force(srp, SG_RQ_INACTIVE);
+		atomic_inc(&sfp->inactives);
+		WRITE_ONCE(srp->frq_pc_bm[0], 0);
+		srp->tag = SG_TAG_WILDCARD;
+		srp->in_resid = 0;
+		srp->rq_info = 0;
+		srp->sense_len = 0;
+	}
+	/* maybe orphaned req, thus never read */
+	if (sbp)
+		mempool_free(sbp, sg_sense_pool);
+}
+
+static void
+sg_deact_request_ulck(struct sg_fd *sfp, struct sg_request *srp)
+{
+	enum sg_rq_state sr_st;
+	u8 *sbp;
+
+	if (WARN_ON(!sfp || !srp))
+		return;
+	SG_LOG(3, sfp, "%s: srp=%pK\n", __func__, srp);
+	sbp = srp->sense_bp;
+	srp->sense_bp = NULL;
+	sr_st = atomic_read(&srp->rq_st);
+	if (sr_st != SG_RQ_SHR_SWAP) {
+		sg_rq_chg_state_force_ulck(srp, SG_RQ_INACTIVE);
 		atomic_inc(&sfp->inactives);
 		WRITE_ONCE(srp->frq_pc_bm[0], 0);
 		srp->tag = SG_TAG_WILDCARD;

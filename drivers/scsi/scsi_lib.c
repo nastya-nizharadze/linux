@@ -22,6 +22,7 @@
 #include <linux/scatterlist.h>
 #include <linux/blk-mq.h>
 #include <linux/ratelimit.h>
+#include <linux/percpu-refcount.h>
 #include <asm/unaligned.h>
 
 #include <scsi/scsi.h>
@@ -1167,6 +1168,7 @@ void scsi_init_command(struct scsi_device *dev, struct scsi_cmnd *cmd)
 	cmd->prot_sdb = prot;
 	cmd->flags = flags;
 	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
+	INIT_WORK(&cmd->tmf_abort_work, scsi_abort_tmf);
 	cmd->jiffies_at_alloc = jiffies_at_alloc;
 	cmd->retries = retries;
 	if (in_flight)
@@ -1619,6 +1621,8 @@ static blk_status_t scsi_mq_prep_fn(struct request *req)
 
 static void scsi_mq_done(struct scsi_cmnd *cmd)
 {
+	if (unlikely(cmd->tmf_status))
+		return;
 	if (unlikely(blk_should_fake_timeout(cmd->request->q)))
 		return;
 	if (unlikely(test_and_set_bit(SCMD_STATE_COMPLETE, &cmd->state)))
@@ -3180,3 +3184,87 @@ int scsi_vpd_tpg_id(struct scsi_device *sdev, int *rel_id)
 	return group_id;
 }
 EXPORT_SYMBOL(scsi_vpd_tpg_id);
+
+/*
+ * scsi_send_tmf -- send Task Managenemt Function
+ *
+ * good description
+ *
+ */
+
+int scsi_send_tmf(struct scsi_device *sdev, struct request *rq, int tmf) {
+	int res = 0;
+	struct scsi_cmnd *scmd = NULL;
+	struct Scsi_Host *shost = sdev->host;
+	unsigned long flags;
+
+	if (rq) {
+		scmd = blk_mq_rq_to_pdu(rq);
+	}
+
+	switch (tmf) {
+		case SCSI_TMF_TASK_ABORT:
+			if (!scmd) {
+				res = -EINVAL;
+				goto out;
+			}
+
+			if (!shost->hostt->eh_abort_handler) {
+				res =  -ENODEV;
+				goto out;
+			}
+			queue_work(shost->tmf_work_q, &scmd->tmf_abort_work);
+
+			//res = shost->hostt->eh_abort_handler(scmd);
+			//blk_put_request(rq); refcount dec
+			break;
+		case SCSI_TMF_TASK_ABORT_SET:
+		case SCSI_TMF_CLEAR_TASK_SET:
+		case SCSI_TMF_CLEAR_ACA:
+		case SCSI_TMF_I_T_NEXUS_RESET:
+		case SCSI_TMF_LOGICAL_UNIT_RESET:
+		case SCSI_TMF_QUERY_TASK:
+		case SCSI_TMF_QUERY_TASK_SET:
+		case SCSI_TMF_QUERY_ASYNC_EVENT:
+		default:
+			break;
+	}
+out:
+	return res;
+}
+EXPORT_SYMBOL(scsi_send_tmf);
+
+void scsi_abort_tmf (struct work_struct *work) {
+	struct scsi_cmnd *scmd =
+		container_of(work, struct scsi_cmnd, tmf_abort_work);
+	struct scsi_device *sdev = scmd->device;
+	struct Scsi_Host *shost = sdev->host;
+	int ret;
+	struct request *rq = scmd->request;
+
+	if (scsi_autopm_get_host(shost) < 0)
+		return -EIO;
+
+	spin_lock_irqsave(shost->host_lock, flags); //все приколы перенести в ворку?
+	shost->tmf_in_progress = 1;
+	spin_unlock_irqrestore(shost->host_lock, flags);
+
+	if (!refcount_inc_not_zero(&rq->ref)){
+		goto out;
+	}
+
+	ret = shost->hostt->eh_abort_handler(scmd);
+	scmd->tmf_status = ret;
+	printf("tmf_status = %d\n", scmd->tmf_status);
+	blk_mq_free_request(rq); //?????
+	printf("good\n");
+	scsi_finish_command(scmd);
+	printf("good 2\n");
+
+out:
+	spin_lock_irqsave(shost->host_lock, flags);
+	shost->tmf_in_progress = 0;
+	spin_unlock_irqrestore(shost->host_lock, flags);
+
+	scsi_autopm_put_host(shost);
+}

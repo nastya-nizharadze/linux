@@ -143,6 +143,8 @@ typedef struct sg_io_hdr {
 #define SG_INFO_DEVICE_DETACHING 0x8	/* completed successfully but ... */
 #define SG_INFO_ABORTED 0x10	/* this command has been aborted */
 #define SG_INFO_MRQ_FINI 0x20	/* marks multi-reqs that have finished */
+#define SG_INFO_SUCCESS 0x40
+#define SG_INFO_FAILED 0x80
 
 /*
  * Pointer to object of this structure filled by ioctl(SG_GET_SCSI_ID). Last

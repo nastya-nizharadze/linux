@@ -71,6 +71,8 @@ struct scsi_cmnd {
 	struct list_head eh_entry; /* entry for the host eh_cmd_q */
 	struct delayed_work abort_work;
 
+	struct work_struct tmf_abort_work;
+	int tmf_status;
 	struct rcu_head rcu;
 
 	int eh_eflags;		/* Used by error handlr */
