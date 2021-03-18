@@ -3193,74 +3193,80 @@ EXPORT_SYMBOL(scsi_vpd_tpg_id);
  */
 
 int scsi_send_tmf(struct scsi_device *sdev, struct request *rq, int tmf) {
-	int res = 0;
-	struct scsi_cmnd *scmd = NULL;
-	struct Scsi_Host *shost = sdev->host;
-	unsigned long flags;
+         int res = 0;
+         struct scsi_cmnd *scmd = NULL;
+         struct Scsi_Host *shost = sdev->host;
 
-	if (rq) {
-		scmd = blk_mq_rq_to_pdu(rq);
-	}
+         if (rq) {
+                 scmd = blk_mq_rq_to_pdu(rq);
+         }
 
-	switch (tmf) {
-		case SCSI_TMF_TASK_ABORT:
-			if (!scmd) {
-				res = -EINVAL;
-				goto out;
-			}
+         switch (tmf) {
+                 case SCSI_TMF_TASK_ABORT:
+                         if (!scmd) {
+                                 res = -EINVAL;
+                                 goto out;
+                         }
 
-			if (!shost->hostt->eh_abort_handler) {
-				res =  -ENODEV;
-				goto out;
-			}
-			queue_work(shost->tmf_work_q, &scmd->tmf_abort_work);
+                         if (!shost->hostt->eh_abort_handler) {
+                                 res =  -ENODEV;
+                                 goto out;
+                         }
+                         queue_work(shost->tmf_work_q, &scmd->tmf_abort_work);
 
-			//res = shost->hostt->eh_abort_handler(scmd);
-			//blk_put_request(rq); refcount dec
-			break;
-		case SCSI_TMF_TASK_ABORT_SET:
-		case SCSI_TMF_CLEAR_TASK_SET:
-		case SCSI_TMF_CLEAR_ACA:
-		case SCSI_TMF_I_T_NEXUS_RESET:
-		case SCSI_TMF_LOGICAL_UNIT_RESET:
-		case SCSI_TMF_QUERY_TASK:
-		case SCSI_TMF_QUERY_TASK_SET:
-		case SCSI_TMF_QUERY_ASYNC_EVENT:
-		default:
-			break;
-	}
+                         //res = shost->hostt->eh_abort_handler(scmd);
+                         //blk_put_request(rq); refcount dec
+                         break;
+                 case SCSI_TMF_TASK_ABORT_SET:
+                 case SCSI_TMF_CLEAR_TASK_SET:
+                 case SCSI_TMF_CLEAR_ACA:
+                 case SCSI_TMF_I_T_NEXUS_RESET:
+                 case SCSI_TMF_LOGICAL_UNIT_RESET:
+                 case SCSI_TMF_QUERY_TASK:
+                 case SCSI_TMF_QUERY_TASK_SET:
+                 case SCSI_TMF_QUERY_ASYNC_EVENT:
+                 default:
+                         break;
+         }
 out:
-	return res;
-}
+         return res;}
 EXPORT_SYMBOL(scsi_send_tmf);
 
 void scsi_abort_tmf (struct work_struct *work) {
-	struct scsi_cmnd *scmd =
-		container_of(work, struct scsi_cmnd, tmf_abort_work);
-	struct scsi_device *sdev = scmd->device;
-	struct Scsi_Host *shost = sdev->host;
-	int ret;
-	struct request *rq = scmd->request;
+         struct scsi_cmnd *scmd =
+                 container_of(work, struct scsi_cmnd, tmf_abort_work);
+         struct scsi_device *sdev = scmd->device;
+         struct Scsi_Host *shost = sdev->host;
+         int ret;
+         unsigned long flags;
+         struct request *rq = scmd->request;
 
-	if (scsi_autopm_get_host(shost) < 0)
-		return -EIO;
+         if (scsi_autopm_get_host(shost) < 0)
+                 return;
 
-	spin_lock_irqsave(shost->host_lock, flags); //все приколы перенести в ворку?
-	shost->tmf_in_progress = 1;
-	spin_unlock_irqrestore(shost->host_lock, flags);
+         spin_lock_irqsave(shost->host_lock, flags); //все приколы перенести в ворку?
+         shost->tmf_in_progress = 1;
+         spin_unlock_irqrestore(shost->host_lock, flags);
 
-	if (!refcount_inc_not_zero(&rq->ref)){
-		goto out;
-	}
+         if (!refcount_inc_not_zero(&rq->ref)){
+                 goto out;
+         }
 
-	ret = shost->hostt->eh_abort_handler(scmd);
-	scmd->tmf_status = ret;
-	printf("tmf_status = %d\n", scmd->tmf_status);
-	blk_mq_free_request(rq); //?????
-	printf("good\n");
-	scsi_finish_command(scmd);
-	printf("good 2\n");
+          if (shost->hostt->eh_timed_out) {
+                 ret = shost->hostt->eh_timed_out(scmd);
 
+                 if (ret != BLK_EH_DONE) {
+                         goto out;
+                 }
+         }
+         ret = shost->hostt->eh_abort_handler(scmd);
+         scmd->tmf_status = ret;
+         printk("tmf_status = %d\n", scmd->tmf_status);
+         //refcount_dec(&rq->ref);
+         blk_mq_free_request(rq); //?????
+         printk("good\n");
+         scsi_finish_command(scmd);
+         printk("good 2\n");
 out:
 	spin_lock_irqsave(shost->host_lock, flags);
 	shost->tmf_in_progress = 0;
