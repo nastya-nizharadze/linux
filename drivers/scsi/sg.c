@@ -94,7 +94,11 @@ enum sg_rq_state {	/* N.B. sg_rq_state_arr assumes SG_RS_AWAIT_RCV==2 */
 	SG_RS_BUSY,		/* temporary state should rarely be seen */
 };
 
+/* If sum_of(dlen) of a fd exceeds this, write() will yield E2BIG */
+#define SG_TOT_FD_THRESHOLD (32 * 1024 * 1024)
+
 #define SG_TIME_UNIT_MS 0	/* milliseconds */
+/* #define SG_TIME_UNIT_NS 1	   nanoseconds */
 #define SG_DEF_TIME_UNIT SG_TIME_UNIT_MS
 #define SG_DEFAULT_TIMEOUT mult_frac(SG_DEFAULT_TIMEOUT_USER, HZ, USER_HZ)
 #define SG_FD_Q_AT_HEAD 0
@@ -238,6 +242,8 @@ struct sg_fd {		/* holds the state of a file descriptor */
 	atomic_t submitted;	/* number inflight or awaiting receive */
 	atomic_t waiting;	/* number of requests awaiting receive */
 	atomic_t inactives;	/* number of inactive requests */
+	atomic_t sum_fd_dlens;	/* when tot_fd_thresh>0 this is sum_of(dlen) */
+	int tot_fd_thresh;	/* E2BIG if sum_of(dlen) > this, 0: ignore */
 	int sgat_elem_sz;	/* initialized to scatter_elem_sz */
 	int mmap_sz;		/* byte size of previous mmap() call */
 	unsigned long ffd_bm[1];	/* see SG_FFD_* defines above */
@@ -2104,8 +2110,8 @@ sg_ctl_extended(struct sg_fd *sfp, void __user *p)
 {
 	int result = 0;
 	int ret = 0;
-	int n, s_wr_mask, s_rd_mask;
-	u32 or_masks;
+	int n, j, s_wr_mask, s_rd_mask;
+	u32 uv, or_masks;
 	struct sg_device *sdp = sfp->parentdp;
 	struct sg_extended_info *seip;
 	struct sg_extended_info sei;
@@ -2122,6 +2128,19 @@ sg_ctl_extended(struct sg_fd *sfp, void __user *p)
 	}
 	SG_LOG(3, sfp, "%s: wr_mask=0x%x rd_mask=0x%x\n", __func__, s_wr_mask,
 	       s_rd_mask);
+	/* tot_fd_thresh (u32), [rbw] [limit for sum of active cmd dlen_s] */
+	if (or_masks & SG_SEIM_TOT_FD_THRESH) {
+		u32 hold = sfp->tot_fd_thresh;
+
+		if (s_wr_mask & SG_SEIM_TOT_FD_THRESH) {
+			uv = seip->tot_fd_thresh;
+			if (uv > 0 && uv < PAGE_SIZE)
+				uv = PAGE_SIZE;
+			sfp->tot_fd_thresh = uv;
+		}
+		if (s_rd_mask & SG_SEIM_TOT_FD_THRESH)
+			seip->tot_fd_thresh = hold;
+	}
 	/* check all boolean flags for either wr or rd mask set in or_mask */
 	if (or_masks & SG_SEIM_CTL_FLAGS)
 		sg_extended_bool_flags(sfp, seip);
@@ -2136,6 +2155,7 @@ sg_ctl_extended(struct sg_fd *sfp, void __user *p)
 	}
 	if ((s_rd_mask & SG_SEIM_READ_VAL) && (s_wr_mask & SG_SEIM_READ_VAL))
 		sg_extended_read_value(sfp, seip);
+	/* call blk_poll() on this fd's HIPRI requests [raw] */
 	if (or_masks & SG_SEIM_BLK_POLL) {
 		n = 0;
 		if (s_wr_mask & SG_SEIM_BLK_POLL) {
@@ -2148,7 +2168,24 @@ sg_ctl_extended(struct sg_fd *sfp, void __user *p)
 			}
 		}
 		if (s_rd_mask & SG_SEIM_BLK_POLL)
-			seip->num = n;
+			seip->num = n;		/* number completed by LLD */
+	}
+	/* override scatter gather element size [rbw] (def: SG_SCATTER_SZ) */
+	if (or_masks & SG_SEIM_SGAT_ELEM_SZ) {
+		n = sfp->sgat_elem_sz;
+		if (s_wr_mask & SG_SEIM_SGAT_ELEM_SZ) {
+			j = (int)seip->sgat_elem_sz;
+			if (!is_power_of_2(j) || j < (int)PAGE_SIZE) {
+				SG_LOG(1, sfp, "%s: %s not power of 2, %s\n",
+				       __func__, "sgat element size",
+				       "or less than PAGE_SIZE");
+				ret = -EINVAL;
+			} else {
+				sfp->sgat_elem_sz = j;
+			}
+		}
+		if (s_rd_mask & SG_SEIM_SGAT_ELEM_SZ)
+			seip->sgat_elem_sz = n; /* prior value if rw */
 	}
 	/* reserved_sz [raw], since may be reduced by other limits */
 	if (s_wr_mask & SG_SEIM_RESERVED_SIZE) {
@@ -3534,6 +3571,8 @@ again:
 	schp->page_order = order;
 	schp->num_sgat = k;
 	schp->buflen = align_sz;
+	if (sfp->tot_fd_thresh > 0)
+		atomic_add(align_sz, &sfp->sum_fd_dlens);
 	return 0;
 err_out:
 	k = pgp - schp->pages;
@@ -3582,6 +3621,14 @@ sg_remove_sgat(struct sg_request *srp)
 		" [rsv]" : ""));
 	sg_remove_sgat_helper(sfp, schp);
 
+	if (sfp->tot_fd_thresh > 0) {
+		/* this is a subtraction, error if it goes negative */
+		if (atomic_add_negative(-schp->buflen, &sfp->sum_fd_dlens)) {
+			SG_LOG(2, sfp, "%s: logic error: this dlen > %s\n",
+			       __func__, "sum_fd_dlens");
+			atomic_set(&sfp->sum_fd_dlens, 0);
+		}
+	}
 	memset(schp, 0, sizeof(*schp));		/* zeros buflen and dlen */
 }
 
@@ -3834,6 +3881,7 @@ sg_setup_req(struct sg_comm_wr_t *cwrp, int dxfr_len)
 	bool second = false;
 	bool has_inactive = false;
 	int l_used_idx;
+	u32 sum_dlen;
 	unsigned long idx, s_idx, end_idx, iflags;
 	struct sg_fd *fp = cwrp->sfp;
 	struct sg_request *r_srp = NULL;	/* request to return */
@@ -3925,6 +3973,13 @@ have_existing:
 			SG_LOG(6, fp, "%s: trying 2nd req but cmd_q=false\n",
 			       __func__);
 			goto fini;
+		} else if (fp->tot_fd_thresh > 0) {
+			sum_dlen = atomic_read(&fp->sum_fd_dlens) + dxfr_len;
+			if (sum_dlen > (u32)fp->tot_fd_thresh) {
+				r_srp = ERR_PTR(-E2BIG);
+				SG_LOG(2, fp, "%s: sum_of_dlen(%u) > %s\n",
+				       __func__, sum_dlen, "tot_fd_thresh");
+			}
 		}
 		r_srp = sg_mk_srp_sgat(fp, act_empty, dxfr_len);
 		if (IS_ERR(r_srp)) {
@@ -4019,6 +4074,8 @@ sg_add_sfp(struct sg_device *sdp)
 	__assign_bit(SG_FFD_KEEP_ORPHAN, sfp->ffd_bm, SG_DEF_KEEP_ORPHAN);
 	__assign_bit(SG_FFD_TIME_IN_NS, sfp->ffd_bm, SG_DEF_TIME_UNIT);
 	__assign_bit(SG_FFD_Q_AT_TAIL, sfp->ffd_bm, SG_DEFAULT_Q_AT);
+	sfp->tot_fd_thresh = SG_TOT_FD_THRESHOLD;
+	atomic_set(&sfp->sum_fd_dlens, 0);
 	/*
 	 * SG_SCATTER_SZ initializes scatter_elem_sz but different value may
 	 * be given as driver/module parameter (e.g. 'scatter_elem_sz=8192').
@@ -4495,8 +4552,9 @@ sg_proc_debug_fd(struct sg_fd *fp, char *obp, int len, unsigned long idx)
 		       (int)test_bit(SG_FFD_KEEP_ORPHAN, fp->ffd_bm),
 		       fp->ffd_bm[0]);
 	n += scnprintf(obp + n, len - n,
-		       "   mmap_sz=%d low_used_idx=%d low_await_idx=%d\n",
-		       fp->mmap_sz, READ_ONCE(fp->low_used_idx), READ_ONCE(fp->low_await_idx));
+		       "   mmap_sz=%d low_used_idx=%d low_await_idx=%d sum_fd_dlens=%u\n",
+		       fp->mmap_sz, READ_ONCE(fp->low_used_idx), READ_ONCE(fp->low_await_idx),
+		       atomic_read(&fp->sum_fd_dlens));
 	n += scnprintf(obp + n, len - n,
 		       "   submitted=%d waiting=%d inactives=%d   open thr_id=%d\n",
 		       atomic_read(&fp->submitted),

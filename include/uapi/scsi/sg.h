@@ -169,6 +169,7 @@ typedef struct sg_req_info {	/* used by SG_GET_REQUEST_TABLE ioctl() */
 #define SG_SEIM_CTL_FLAGS	0x1	/* ctl_flags_mask bits in ctl_flags */
 #define SG_SEIM_READ_VAL	0x2	/* write SG_SEIRV_*, read back value */
 #define SG_SEIM_RESERVED_SIZE	0x4	/* reserved_sz of reserve request */
+#define SG_SEIM_TOT_FD_THRESH	0x8	/* tot_fd_thresh of data buffers */
 #define SG_SEIM_MINOR_INDEX	0x10	/* sg device minor index number */
 #define SG_SEIM_SGAT_ELEM_SZ	0x80	/* sgat element size (>= PAGE_SIZE) */
 #define SG_SEIM_BLK_POLL	0x100	/* call blk_poll, uses 'num' field */
