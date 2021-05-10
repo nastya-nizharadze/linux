@@ -112,6 +112,9 @@ typedef struct sg_io_hdr {
 #define SGV4_FLAG_Q_AT_HEAD SG_FLAG_Q_AT_HEAD
 #define SGV4_FLAG_IMMED 0x400 /* for polling with SG_IOR, ignored in SG_IOS */
 #define SGV4_FLAG_HIPRI 0x800 /* request will use blk_poll to complete */
+#define SGV4_FLAG_DEV_SCOPE 0x1000 /* permit SG_IOABORT to have wider scope */
+#define SGV4_FLAG_SHARE 0x2000	/* share IO buffer; needs SG_SEIM_SHARE_FD */
+#define SGV4_FLAG_NO_DXFER SG_FLAG_NO_DXFER /* but keep dev<-->kernel xfr */
 
 /* Output (potentially OR-ed together) in v3::info or v4::info field */
 #define SG_INFO_OK_MASK 0x1
@@ -184,7 +187,12 @@ typedef struct sg_req_info {	/* used by SG_GET_REQUEST_TABLE ioctl() */
 #define SG_CTL_FLAGM_OTHER_OPENS 0x4	/* rd: other sg fd_s on this dev */
 #define SG_CTL_FLAGM_ORPHANS	0x8	/* rd: orphaned requests on this fd */
 #define SG_CTL_FLAGM_Q_TAIL	0x10	/* used for future cmds on this fd */
+#define SG_CTL_FLAGM_IS_SHARE	0x20	/* rd: fd is read-side or write-side share */
+#define SG_CTL_FLAGM_IS_READ_SIDE 0x40	/* rd: this fd is read-side share */
 #define SG_CTL_FLAGM_UNSHARE	0x80	/* undo share after inflight cmd */
+/* rd> 1: read-side finished 0: not; wr> 1: finish share post read-side */
+#define SG_CTL_FLAGM_READ_SIDE_FINI 0x100 /* wr> 0: setup for repeat write-side req */
+#define SG_CTL_FLAGM_READ_SIDE_ERR 0x200 /* rd: sharing, read-side got error */
 #define SG_CTL_FLAGM_NO_DURATION 0x400	/* don't calc command duration */
 #define SG_CTL_FLAGM_MORE_ASYNC	0x800	/* yield EAGAIN in more cases */
 #define SG_CTL_FLAGM_ALL_BITS	0xfff	/* should be OR of previous items */
