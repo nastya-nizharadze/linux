@@ -32,7 +32,11 @@
 #include <linux/types.h>
 #include <linux/major.h>
 
-/* bsg.h contains the sg v4 user space interface structure (sg_io_v4). */
+/*
+ * bsg.h contains the sg v4 user space interface structure (sg_io_v4).
+ * That structure is also used as the controlling object when multiple
+ * requests are issued with one ioctl() call.
+ */
 #include <linux/bsg.h>
 
 /*
@@ -110,11 +114,16 @@ typedef struct sg_io_hdr {
 #define SGV4_FLAG_YIELD_TAG 0x8  /* sg_io_v4::generated_tag set after SG_IOS */
 #define SGV4_FLAG_Q_AT_TAIL SG_FLAG_Q_AT_TAIL
 #define SGV4_FLAG_Q_AT_HEAD SG_FLAG_Q_AT_HEAD
+#define SGV4_FLAG_COMPLETE_B4  0x100
+#define SGV4_FLAG_SIGNAL  0x200	/* v3: ignored; v4 signal on completion */
 #define SGV4_FLAG_IMMED 0x400 /* for polling with SG_IOR, ignored in SG_IOS */
 #define SGV4_FLAG_HIPRI 0x800 /* request will use blk_poll to complete */
-#define SGV4_FLAG_DEV_SCOPE 0x1000 /* permit SG_IOABORT to have wider scope */
-#define SGV4_FLAG_SHARE 0x2000	/* share IO buffer; needs SG_SEIM_SHARE_FD */
+#define SGV4_FLAG_STOP_IF 0x1000	/* Stops sync mrq if error or warning */
+#define SGV4_FLAG_DEV_SCOPE 0x2000 /* permit SG_IOABORT to have wider scope */
+#define SGV4_FLAG_SHARE 0x4000	/* share IO buffer; needs SG_SEIM_SHARE_FD */
+#define SGV4_FLAG_DO_ON_OTHER 0x8000 /* available on either of shared pair */
 #define SGV4_FLAG_NO_DXFER SG_FLAG_NO_DXFER /* but keep dev<-->kernel xfr */
+#define SGV4_FLAG_MULTIPLE_REQS 0x20000	/* n sg_io_v4s in data-in */
 
 /* Output (potentially OR-ed together) in v3::info or v4::info field */
 #define SG_INFO_OK_MASK 0x1
