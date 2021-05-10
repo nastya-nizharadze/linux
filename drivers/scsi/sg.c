@@ -113,6 +113,7 @@ enum sg_rq_state {	/* N.B. sg_rq_state_arr assumes SG_RS_AWAIT_RCV==2 */
 #define SG_FRQ_IS_ORPHAN	1	/* owner of request gone */
 #define SG_FRQ_SYNC_INVOC	2	/* synchronous (blocking) invocation */
 #define SG_FRQ_NO_US_XFER	3	/* no user space transfer of data */
+#define SG_FRQ_ABORTING		4	/* in process of aborting this cmd */
 #define SG_FRQ_DEACT_ORPHAN	6	/* not keeping orphan so de-activate */
 #define SG_FRQ_RECEIVING	7	/* guard against multiple receivers */
 #define SG_FRQ_FOR_MMAP		8	/* request needs PAGE_SIZE elements */
@@ -1801,6 +1802,93 @@ sg_ctl_sg_io(struct file *filp, struct sg_device *sdp, struct sg_fd *sfp,
 	return res;
 }
 
+static struct sg_request *
+sg_match_request(struct sg_fd *sfp, int id)
+{
+	int num_waiting = atomic_read(&sfp->waiting);
+	unsigned long idx;
+	struct sg_request *srp;
+
+	if (num_waiting < 1)
+		return NULL;
+	if (id == SG_PACK_ID_WILDCARD) {
+		xa_for_each_marked(&sfp->srp_arr, idx, srp, SG_XA_RQ_AWAIT)
+			return srp;
+	} else {
+		xa_for_each_marked(&sfp->srp_arr, idx, srp, SG_XA_RQ_AWAIT) {
+			if (id == srp->pack_id)
+				return srp;
+		}
+	}
+	return NULL;
+}
+
+static int
+sg_ctl_abort(struct sg_device *sdp, struct sg_fd *sfp, void __user *p)
+{
+	int res, pack_id, id;
+	unsigned long iflags, idx;
+	struct sg_fd *o_sfp;
+	struct sg_request *srp;
+	struct sg_io_v4 io_v4;
+	struct sg_io_v4 *h4p = &io_v4;
+
+	if (copy_from_user(h4p, p, SZ_SG_IO_V4))
+		return -EFAULT;
+	if (h4p->guard != 'Q' || h4p->protocol != 0 || h4p->subprotocol != 0)
+		return -EPERM;
+	pack_id = h4p->request_extra;
+	id = pack_id;
+
+	xa_lock_irqsave(&sfp->srp_arr, iflags);
+	srp = sg_match_request(sfp, id);
+	if (!srp) {	/* assume device (not just fd) scope */
+		xa_unlock_irqrestore(&sfp->srp_arr, iflags);
+		xa_for_each(&sdp->sfp_arr, idx, o_sfp) {
+			if (o_sfp == sfp)
+				continue;	/* already checked */
+			srp = sg_match_request(o_sfp, id);
+			if (srp) {
+				sfp = o_sfp;
+				xa_lock_irqsave(&sfp->srp_arr, iflags);
+				break;
+			}
+		}
+		if (!srp)
+			return -ENODATA;
+	}
+
+	set_bit(SG_FRQ_ABORTING, srp->frq_bm);
+	res = 0;
+	switch (atomic_read(&srp->rq_st)) {
+	case SG_RS_BUSY:
+		clear_bit(SG_FRQ_ABORTING, srp->frq_bm);
+		res = -EBUSY;	/* shouldn't occur often */
+		break;
+	case SG_RS_INACTIVE:	/* inactive on rq_list not good */
+		clear_bit(SG_FRQ_ABORTING, srp->frq_bm);
+		res = -EPROTO;
+		break;
+	case SG_RS_AWAIT_RCV:	/* user should still do completion */
+		clear_bit(SG_FRQ_ABORTING, srp->frq_bm);
+		break;		/* nothing to do here, return 0 */
+	case SG_RS_INFLIGHT:	/* only attempt abort if inflight */
+		srp->rq_result |= (DRIVER_SOFT << 24);
+		{
+			struct request *rqq = READ_ONCE(srp->rqq);
+
+			if (rqq)
+				blk_abort_request(rqq);
+		}
+		break;
+	default:
+		clear_bit(SG_FRQ_ABORTING, srp->frq_bm);
+		break;
+	}
+	xa_unlock_irqrestore(&sfp->srp_arr, iflags);
+	return res;
+}
+
 /*
  * First normalize want_rsv_sz to be >= sfp->sgat_elem_sz and
  * <= max_segment_size. Exit if that is the same as old size; otherwise
@@ -1889,8 +1977,6 @@ sg_ctl_req_tbl(struct sg_fd *sfp, void __user *p)
 		return -ENOMEM;
 	val = 0;
 	xa_for_each(&sfp->srp_arr, idx, srp) {
-		if (!srp)
-			continue;
 		if (val >= SG_MAX_QUEUE)
 			break;
 		if (xa_get_mark(&sfp->srp_arr, idx, SG_XA_RQ_INACTIVE))
@@ -1899,8 +1985,6 @@ sg_ctl_req_tbl(struct sg_fd *sfp, void __user *p)
 		val++;
 	}
 	xa_for_each(&sfp->srp_arr, idx, srp) {
-		if (!srp)
-			continue;
 		if (val >= SG_MAX_QUEUE)
 			break;
 		if (!xa_get_mark(&sfp->srp_arr, idx, SG_XA_RQ_INACTIVE))
@@ -1950,7 +2034,7 @@ sg_ioctl_common(struct file *filp, struct sg_device *sdp, struct sg_fd *sfp,
 {
 	bool read_only = O_RDWR != (filp->f_flags & O_ACCMODE);
 	int val;
-	int result = 0;
+	int res = 0;
 	int __user *ip = p;
 	struct sg_request *srp;
 	struct scsi_device *sdev;
@@ -1978,13 +2062,21 @@ sg_ioctl_common(struct file *filp, struct sg_device *sdp, struct sg_fd *sfp,
 	case SG_IORECEIVE_V3:
 		SG_LOG(3, sfp, "%s:    SG_IORECEIVE_V3\n", __func__);
 		return sg_ctl_ioreceive_v3(filp, sfp, p);
+	case SG_IOABORT:
+		SG_LOG(3, sfp, "%s:    SG_IOABORT\n", __func__);
+		if (read_only)
+			return -EPERM;
+		mutex_lock(&sfp->f_mutex);
+		res = sg_ctl_abort(sdp, sfp, p);
+		mutex_unlock(&sfp->f_mutex);
+		return res;
 	case SG_GET_SCSI_ID:
 		return sg_ctl_scsi_id(sdev, sfp, p);
 	case SG_SET_FORCE_PACK_ID:
 		SG_LOG(3, sfp, "%s:    SG_SET_FORCE_PACK_ID\n", __func__);
-		result = get_user(val, ip);
-		if (result)
-			return result;
+		res = get_user(val, ip);
+		if (res)
+			return res;
 		assign_bit(SG_FFD_FORCE_PACKID, sfp->ffd_bm, !!val);
 		return 0;
 	case SG_GET_PACK_ID:    /* or tag of oldest "read"-able, -1 if none */
@@ -2009,18 +2101,18 @@ sg_ioctl_common(struct file *filp, struct sg_device *sdp, struct sg_fd *sfp,
 		       sdp->max_sgat_sz);
 		return put_user(sdp->max_sgat_sz, ip);
 	case SG_SET_RESERVED_SIZE:
-		result = get_user(val, ip);
-		if (!result) {
+		res = get_user(val, ip);
+		if (!res) {
 			if (val >= 0 && val <= (1024 * 1024 * 1024)) {
 				mutex_lock(&sfp->f_mutex);
-				result = sg_set_reserved_sz(sfp, val);
+				res = sg_set_reserved_sz(sfp, val);
 				mutex_unlock(&sfp->f_mutex);
 			} else {
 				SG_LOG(3, sfp, "%s: invalid size\n", __func__);
-				result = -EINVAL;
+				res = -EINVAL;
 			}
 		}
-		return result;
+		return res;
 	case SG_GET_RESERVED_SIZE:
 		mutex_lock(&sfp->f_mutex);
 		val = min_t(int, sfp->rsv_srp->sgat_h.buflen,
@@ -2028,13 +2120,13 @@ sg_ioctl_common(struct file *filp, struct sg_device *sdp, struct sg_fd *sfp,
 		mutex_unlock(&sfp->f_mutex);
 		SG_LOG(3, sfp, "%s:    SG_GET_RESERVED_SIZE=%d\n",
 		       __func__, val);
-		result = put_user(val, ip);
-		return result;
+		res = put_user(val, ip);
+		return res;
 	case SG_SET_COMMAND_Q:
 		SG_LOG(3, sfp, "%s:    SG_SET_COMMAND_Q\n", __func__);
-		result = get_user(val, ip);
-		if (result)
-			return result;
+		res = get_user(val, ip);
+		if (res)
+			return res;
 		assign_bit(SG_FFD_CMD_Q, sfp->ffd_bm, !!val);
 		return 0;
 	case SG_GET_COMMAND_Q:
@@ -2042,9 +2134,9 @@ sg_ioctl_common(struct file *filp, struct sg_device *sdp, struct sg_fd *sfp,
 		return put_user(test_bit(SG_FFD_CMD_Q, sfp->ffd_bm), ip);
 	case SG_SET_KEEP_ORPHAN:
 		SG_LOG(3, sfp, "%s:    SG_SET_KEEP_ORPHAN\n", __func__);
-		result = get_user(val, ip);
-		if (result)
-			return result;
+		res = get_user(val, ip);
+		if (res)
+			return res;
 		assign_bit(SG_FFD_KEEP_ORPHAN, sfp->ffd_bm, !!val);
 		return 0;
 	case SG_GET_KEEP_ORPHAN:
@@ -2061,9 +2153,9 @@ sg_ioctl_common(struct file *filp, struct sg_device *sdp, struct sg_fd *sfp,
 		break;
 	case SG_SET_TIMEOUT:
 		SG_LOG(3, sfp, "%s:    SG_SET_TIMEOUT\n", __func__);
-		result = get_user(val, ip);
-		if (result)
-			return result;
+		res = get_user(val, ip);
+		if (res)
+			return res;
 		if (val < 0)
 			return -EIO;
 		if (val >= mult_frac((s64)INT_MAX, USER_HZ, HZ))
@@ -2089,9 +2181,9 @@ sg_ioctl_common(struct file *filp, struct sg_device *sdp, struct sg_fd *sfp,
 		return put_user(0, ip);
 	case SG_NEXT_CMD_LEN:	/* active only in v2 interface */
 		SG_LOG(3, sfp, "%s:    SG_NEXT_CMD_LEN\n", __func__);
-		result = get_user(val, ip);
-		if (result)
-			return result;
+		res = get_user(val, ip);
+		if (res)
+			return res;
 		if (val > SG_MAX_CDB_SIZE)
 			return -ENOMEM;
 		mutex_lock(&sfp->f_mutex);
@@ -2114,9 +2206,9 @@ sg_ioctl_common(struct file *filp, struct sg_device *sdp, struct sg_fd *sfp,
 				     p);
 	case SG_SET_DEBUG:
 		SG_LOG(3, sfp, "%s:    SG_SET_DEBUG\n", __func__);
-		result = get_user(val, ip);
-		if (result)
-			return result;
+		res = get_user(val, ip);
+		if (res)
+			return res;
 		assign_bit(SG_FDEV_LOG_SENSE, sdp->fdev_bm, !!val);
 		if (val == 0)	/* user can force recalculation */
 			sg_calc_sgat_param(sdp);
@@ -2161,9 +2253,9 @@ sg_ioctl_common(struct file *filp, struct sg_device *sdp, struct sg_fd *sfp,
 			return -EPERM;	/* don't know, so take safer approach */
 		break;
 	}
-	result = sg_allow_if_err_recovery(sdp, filp->f_flags & O_NDELAY);
-	if (unlikely(result))
-		return result;
+	res = sg_allow_if_err_recovery(sdp, filp->f_flags & O_NDELAY);
+	if (unlikely(res))
+		return res;
 	return -ENOIOCTLCMD;
 }
 
@@ -2804,8 +2896,6 @@ sg_remove_device(struct device *cl_dev, struct class_interface *cl_intf)
 					"%s: 0x%pK\n", __func__, sdp));
 
 	xa_for_each(&sdp->sfp_arr, idx, sfp) {
-		if (!sfp)
-			continue;
 		wake_up_interruptible_all(&sfp->read_wait);
 		kill_fasync(&sfp->async_qp, SIGPOLL, POLL_HUP);
 	}
@@ -3815,8 +3905,6 @@ sg_remove_sfp_usercontext(struct work_struct *work)
 
 	/* Cleanup any responses which were never read(). */
 	xa_for_each(xafp, idx, srp) {
-		if (!srp)
-			continue;
 		if (!xa_get_mark(xafp, srp->rq_idx, SG_XA_RQ_INACTIVE))
 			sg_finish_scsi_blk_rq(srp);
 		if (srp->sgat_h.buflen > 0)
@@ -4121,7 +4209,6 @@ sg_proc_seq_show_devstrs(struct seq_file *s, void *v)
 /* Writes debug info for one sg_request in obp buffer */
 static int
 sg_proc_debug_sreq(struct sg_request *srp, int to, char *obp, int len)
-		__must_hold(sfp->srp_arr.xa_lock)
 {
 	bool is_v3v4, v4, is_dur;
 	int n = 0;
@@ -4191,8 +4278,6 @@ sg_proc_debug_fd(struct sg_fd *fp, char *obp, int len, unsigned long idx)
 	k = 0;
 	xa_lock_irqsave(&fp->srp_arr, iflags);
 	xa_for_each(&fp->srp_arr, idx, srp) {
-		if (!srp)
-			continue;
 		if (xa_get_mark(&fp->srp_arr, idx, SG_XA_RQ_INACTIVE))
 			continue;
 		n += sg_proc_debug_sreq(srp, fp->timeout, obp + n, len - n);
@@ -4207,8 +4292,6 @@ sg_proc_debug_fd(struct sg_fd *fp, char *obp, int len, unsigned long idx)
 		n += scnprintf(obp + n, len - n, "     No requests active\n");
 	k = 0;
 	xa_for_each_marked(&fp->srp_arr, idx, srp, SG_XA_RQ_INACTIVE) {
-		if (!srp)
-			continue;
 		if (k == 0)
 			n += scnprintf(obp + n, len - n, "   Inactives:\n");
 		n += sg_proc_debug_sreq(srp, fp->timeout, obp + n, len - n);
@@ -4226,7 +4309,6 @@ sg_proc_debug_fd(struct sg_fd *fp, char *obp, int len, unsigned long idx)
 /* Writes debug info for one sg device (including its sg fds) in obp buffer */
 static int
 sg_proc_debug_sdev(struct sg_device *sdp, char *obp, int len, int *fd_counterp)
-		__must_hold(sg_index_lock)
 {
 	int n = 0;
 	int my_count = 0;
@@ -4246,8 +4328,6 @@ sg_proc_debug_sdev(struct sg_device *sdp, char *obp, int len, int *fd_counterp)
 		       ilog2(sdp->max_sgat_sz), sdp->max_sgat_elems,
 		       SG_HAVE_EXCLUDE(sdp), atomic_read(&sdp->open_cnt));
 	xa_for_each(&sdp->sfp_arr, idx, fp) {
-		if (!fp)
-			continue;
 		++*countp;
 		n += scnprintf(obp + n, len - n, "  FD(%d): ", *countp);
 		n += sg_proc_debug_fd(fp, obp + n, len - n, idx);

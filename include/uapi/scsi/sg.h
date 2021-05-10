@@ -364,6 +364,9 @@ struct sg_header {
 /* Gives some v3 identifying info to driver, receives associated response */
 #define SG_IORECEIVE_V3 _IOWR(SG_IOCTL_MAGIC_NUM, 0x46, struct sg_io_hdr)
 
+/* Provides identifying info about a prior submission (e.g. a tag) */
+#define SG_IOABORT _IOW(SG_IOCTL_MAGIC_NUM, 0x43, struct sg_io_v4)
+
 /* command queuing is always on when the v3 or v4 interface is used */
 #define SG_DEF_COMMAND_Q 0
 
