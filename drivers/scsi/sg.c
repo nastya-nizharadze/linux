@@ -12,8 +12,8 @@
  *
  */
 
-static int sg_version_num = 40012;  /* [x]xyyzz where [x] empty when x=0 */
-#define SG_VERSION_STR "4.0.12"		/* [x]x.[y]y.zz */
+static int sg_version_num = 40047;  /* [x]xyyzz where [x] empty when x=0 */
+#define SG_VERSION_STR "4.0.47"		/* [x]x.[y]y.zz */
 static char *sg_version_date = "20210522";
 
 #include <linux/module.h>
