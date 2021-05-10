@@ -127,6 +127,7 @@ typedef struct sg_io_hdr {
 #define SGV4_FLAG_NO_DXFER SG_FLAG_NO_DXFER /* but keep dev<-->kernel xfr */
 #define SGV4_FLAG_KEEP_SHARE 0x20000  /* ... buffer for another dout command */
 #define SGV4_FLAG_MULTIPLE_REQS 0x40000	/* 1 or more sg_io_v4-s in data-in */
+#define SGV4_FLAG_ORDERED_WR 0x80000	/* svb: issue in-order writes */
 
 /* Output (potentially OR-ed together) in v3::info or v4::info field */
 #define SG_INFO_OK_MASK 0x1
