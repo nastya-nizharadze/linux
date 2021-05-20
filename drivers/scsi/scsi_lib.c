@@ -22,6 +22,7 @@
 #include <linux/scatterlist.h>
 #include <linux/blk-mq.h>
 #include <linux/ratelimit.h>
+#include <linux/percpu-refcount.h>
 #include <asm/unaligned.h>
 
 #include <scsi/scsi.h>
@@ -56,6 +57,7 @@ static struct kmem_cache *scsi_sense_cache;
 static DEFINE_MUTEX(scsi_sense_cache_mutex);
 
 static void scsi_mq_uninit_cmd(struct scsi_cmnd *cmd);
+void scsi_abort_tmf (struct scsi_cmnd *scmd);
 
 int scsi_init_sense_cache(struct Scsi_Host *shost)
 {
@@ -3218,3 +3220,100 @@ int scsi_vpd_tpg_id(struct scsi_device *sdev, int *rel_id)
 	return group_id;
 }
 EXPORT_SYMBOL(scsi_vpd_tpg_id);
+
+void scsi_abort_done (struct scsi_cmnd *scmd) {
+	scmd->scsi_end_tmf(scmd);
+
+	if (refcount_dec_and_test(&scmd->request->ref))
+		__blk_mq_free_request(scmd->request);
+
+}
+
+void scsi_abort_tmf (struct scsi_cmnd *scmd) {
+	struct scsi_device *sdev = scmd->device;
+	struct Scsi_Host *shost = sdev->host;
+	int ret;
+	unsigned long flags;
+	struct request *rq = scmd->request;
+
+	if (scsi_autopm_get_host(shost) < 0)
+		return;
+
+	spin_lock_irqsave(shost->host_lock, flags);
+	shost->tmf_in_progress = 1;
+	spin_unlock_irqrestore(shost->host_lock, flags);
+
+	if (!refcount_inc_not_zero(&rq->ref)){
+		goto out;
+	}
+
+	if (shost->hostt->eh_timed_out) {
+		ret = shost->hostt->eh_timed_out(scmd);
+		if (ret != BLK_EH_DONE) {
+			goto out;
+		}
+	}
+	scmd->scsi_tmf_done = scsi_abort_done;
+	ret = shost->hostt->eh_abort_handler(scmd);
+
+out:
+	spin_lock_irqsave(shost->host_lock, flags);
+	shost->tmf_in_progress = 0;
+	spin_unlock_irqrestore(shost->host_lock, flags);
+
+	scsi_autopm_put_host(shost);
+	return;
+}
+
+/*
+ * scsi_send_tmf -- send Task Managenemt Function
+ *
+ * good description
+ *
+ */
+
+int scsi_send_tmf(struct scsi_device *sdev, struct request *rq, int tmf, void (*end_tmf)(void * arg)) {
+	int res = 0;
+	struct scsi_cmnd *scmd = NULL;
+	struct Scsi_Host *shost = sdev->host;
+	bool in_flight;
+
+	if (rq) {
+		scmd = blk_mq_rq_to_pdu(rq);
+	}
+
+	switch (tmf) {
+		case SCSI_TMF_TASK_ABORT:
+			if (!scmd) {
+				res = -EINVAL;
+				goto out;
+			}
+			scmd->scsi_end_tmf = end_tmf;
+			in_flight = test_bit(SCMD_STATE_INFLIGHT, &scmd->state);
+			if (!(in_flight)) {
+				res = -EINVAL;
+				goto out;
+			}
+
+			if (!shost->hostt->eh_abort_handler) {
+				res =  -ENODEV;
+				goto out;
+			}
+			scsi_abort_tmf(scmd);
+			break;
+		case SCSI_TMF_TASK_ABORT_SET:
+		case SCSI_TMF_CLEAR_TASK_SET:
+		case SCSI_TMF_CLEAR_ACA:
+		case SCSI_TMF_I_T_NEXUS_RESET:
+		case SCSI_TMF_LOGICAL_UNIT_RESET:
+		case SCSI_TMF_QUERY_TASK:
+		case SCSI_TMF_QUERY_TASK_SET:
+		case SCSI_TMF_QUERY_ASYNC_EVENT:
+		default:
+			break;
+	}
+out:
+	return res;
+}
+EXPORT_SYMBOL(scsi_send_tmf);
+

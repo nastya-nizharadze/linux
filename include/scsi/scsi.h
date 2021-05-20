@@ -256,6 +256,20 @@ enum scsi_disposition {
 #define SCSI_INQ_PQ_NOT_CON     0x01
 #define SCSI_INQ_PQ_NOT_CAP     0x03
 
+/*
+ * SCSI Task Management Functions
+ */
+enum scsi_tmf {
+	SCSI_TMF_TASK_ABORT = 1,
+	SCSI_TMF_TASK_ABORT_SET,
+	SCSI_TMF_CLEAR_TASK_SET,
+	SCSI_TMF_CLEAR_ACA,
+	SCSI_TMF_I_T_NEXUS_RESET,
+	SCSI_TMF_LOGICAL_UNIT_RESET,
+	SCSI_TMF_QUERY_TASK,
+	SCSI_TMF_QUERY_TASK_SET,
+	SCSI_TMF_QUERY_ASYNC_EVENT
+};
 
 /*
  * Here are some scsi specific ioctl commands which are sometimes useful.

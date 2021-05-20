@@ -444,6 +444,8 @@ extern int __scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
 			unsigned char *sense, struct scsi_sense_hdr *sshdr,
 			int timeout, int retries, u64 flags,
 			req_flags_t rq_flags, int *resid);
+extern int scsi_send_tmf(struct scsi_device *sdev, struct request *rq, int tmf, void (*end_tmf)(void * arg));
+extern void scsi_abort_tmf (struct scsi_cmnd *scmd);
 /* Make sure any sense buffer is the correct size. */
 #define scsi_execute(sdev, cmd, data_direction, buffer, bufflen, sense,	\
 		     sshdr, timeout, retries, flags, rq_flags, resid)	\
