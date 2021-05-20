@@ -486,7 +486,7 @@ out_queue_exit:
 }
 EXPORT_SYMBOL_GPL(blk_mq_alloc_request_hctx);
 
-static void __blk_mq_free_request(struct request *rq)
+void __blk_mq_free_request(struct request *rq)
 {
 	struct request_queue *q = rq->q;
 	struct blk_mq_ctx *ctx = rq->mq_ctx;
@@ -503,6 +503,8 @@ static void __blk_mq_free_request(struct request *rq)
 	blk_mq_sched_restart(hctx);
 	blk_queue_exit(q);
 }
+EXPORT_SYMBOL(__blk_mq_free_request);
+
 
 void blk_mq_free_request(struct request *rq)
 {
