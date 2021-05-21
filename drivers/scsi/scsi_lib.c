@@ -1139,6 +1139,7 @@ void scsi_init_command(struct scsi_device *dev, struct scsi_cmnd *cmd)
 	cmd->sense_buffer = buf;
 	cmd->prot_sdb = prot;
 	cmd->flags = flags;
+	cmd->async_tmf = false;
 	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
 	cmd->jiffies_at_alloc = jiffies_at_alloc;
 	cmd->retries = retries;
@@ -3254,6 +3255,7 @@ void scsi_abort_tmf (struct scsi_cmnd *scmd) {
 		}
 	}
 	scmd->scsi_tmf_done = scsi_abort_done;
+	scmd->async_tmf = true;
 	ret = shost->hostt->eh_abort_handler(scmd);
 
 out:

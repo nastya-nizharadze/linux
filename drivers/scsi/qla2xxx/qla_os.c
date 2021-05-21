@@ -1236,6 +1236,7 @@ qla2xxx_eh_abort(struct scsi_cmnd *cmd)
 	uint32_t ratov_j;
 	struct qla_qpair *qpair;
 	unsigned long flags;
+	bool async = cmd->async_tmf;
 
 	if (qla2x00_isp_reg_stat(ha)) {
 		ql_log(ql_log_info, vha, 0x8042,
@@ -1256,10 +1257,11 @@ qla2xxx_eh_abort(struct scsi_cmnd *cmd)
 	if ((sp->fcport && sp->fcport->deleted) || !qpair)
 		return SUCCESS;
 
-	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
-	sp->comp = &comp;
-	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
-
+	if (!async) {
+		spin_lock_irqsave(qpair->qp_lock_ptr, flags);
+		sp->comp = &comp;
+		spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
+	}
 
 	id = cmd->device->id;
 	lun = cmd->device->lun;
@@ -1283,7 +1285,9 @@ qla2xxx_eh_abort(struct scsi_cmnd *cmd)
 	ratov_j = msecs_to_jiffies(ratov_j);
 	switch (rval) {
 	case QLA_SUCCESS:
-		if (!wait_for_completion_timeout(&comp, ratov_j)) {
+		if (async)
+			ret = SUCCESS;
+		else if (!wait_for_completion_timeout(&comp, ratov_j)) {
 			ql_dbg(ql_dbg_taskm, vha, 0xffff,
 			    "%s: Abort wait timer (4 * R_A_TOV[%d]) expired\n",
 			    __func__, ha->r_a_tov/10);

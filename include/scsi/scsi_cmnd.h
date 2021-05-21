@@ -144,9 +144,10 @@ struct scsi_cmnd {
 
 	unsigned char tag;	/* SCSI-II queued command tag */
 	unsigned int extra_len;	/* length of alignment and padding */
-	unsigned int tmf_status; //delete it
+	unsigned int tmf_status;
 	void (*scsi_tmf_done) (struct scsi_cmnd *);
 	void (*scsi_end_tmf) (void * arg);
+	bool async_tmf;
 };
 
 /*
