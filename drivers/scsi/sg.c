@@ -50,6 +50,7 @@ static char *sg_version_date = "20210522";
 #include <linux/debugfs.h>
 
 #include <scsi/scsi.h>
+#include <scsi/scsi_cmnd.h>
 #include <scsi/scsi_eh.h>
 #include <scsi/scsi_dbg.h>
 #include <scsi/scsi_host.h>
@@ -99,6 +100,12 @@ enum sg_rq_state {	/* N.B. sg_rq_state_arr assumes SG_RQ_AWAIT_RCV==2 */
 	SG_RQ_BUSY,		/* temporary state should rarely be seen */
 	SG_RQ_SHR_SWAP,		/* read-side: is finished, await swap to write-side */
 	SG_RQ_SHR_IN_WS,	/* read-side: waits while write-side inflight */
+	SG_RQ_AWAIT_TMF,
+};
+
+enum sg_tmf_state {
+	SG_TMF_INFLIGHT,
+	SG_TMF_AWAIT_RCV,
 };
 
 /* these varieties of share requests are known before a request is created */
@@ -320,6 +327,7 @@ struct sg_fd {		/* holds the state of a file descriptor */
 	struct kref f_ref;
 	struct execute_work ew_fd;  /* harvest all fd resources and lists */
 	struct sg_request *rsv_arr[SG_MAX_RSV_REQS];
+	struct list_head tmf_head;
 };
 
 struct sg_fd_pollable {		/* sfp plus adds context for completions */
@@ -390,6 +398,14 @@ struct sg_svb_elem {	/* context of shared variable blocking (svb) per SG_MAX_RSV
 	struct sg_request *prev_ws_srp;	/* previous write-side object ptr, candidate for next */
 };
 
+struct sg_tmf {
+	struct list_head tmf_list;
+	struct sg_request *srp;
+	int type;
+	atomic_t state;
+	int status;
+};
+
 /* tasklet or soft irq callback */
 static void sg_rq_end_io(struct request *rqq, blk_status_t status);
 /* Declarations of other static functions used before they are defined */
@@ -424,6 +440,10 @@ static int sg_finish_rs_rq(struct sg_fd *sfp, struct sg_request *rs_srp, bool ev
 static void sg_rq_chg_state_force(struct sg_request *srp, enum sg_rq_state new_st);
 static int sg_sfp_blk_poll_first(struct sg_fd *sfp);
 static int sg_sfp_blk_poll_all(struct sg_fd *sfp, int loop_count);
+static int sg_send_tmf(struct sg_fd *sfp, struct sg_io_v4 *h4p);
+static struct sg_request *
+sg_match_request_tmf(struct sg_fd_pollable *a_sfpoll);
+
 
 #if IS_ENABLED(CONFIG_SCSI_LOGGING) && IS_ENABLED(SG_DEBUG)
 static const char *sg_rq_st_str(enum sg_rq_state rq_st, bool long_str);
@@ -2440,6 +2460,12 @@ sg_submit_v4(struct sg_fd *sfp, void __user *p, struct sg_io_v4 *h4p, bool from_
 	struct sg_request *srp;
 	struct sg_comm_wr_t cwr;
 
+	if (h4p->subprotocol == BSG_SUB_PROTOCOL_SCSI_TMF) {
+		SG_LOG(6, sfp, "%s: send TMF\n", __func__);
+		res = sg_send_tmf(sfp, h4p);
+		return res;
+	}
+
 	sg_comm_wr_init(&cwr);
 	dlen = h4p->din_xfer_len ? h4p->din_xfer_len : h4p->dout_xfer_len;
 	cwr.dlen = dlen;
@@ -2863,6 +2889,139 @@ sg_get_rsv_str_lck(struct sg_request *srp, const char *leadin, const char *leado
 	return cp;
 }
 
+void
+sg_init_tmf(unsigned int type, struct sg_request *srp, struct sg_fd *sfp) {
+	struct sg_tmf *tmfp;
+
+	tmfp = kcalloc (1, sizeof (struct sg_tmf), GFP_KERNEL);
+	list_add_tail(&tmfp->tmf_list, &sfp->tmf_head);
+	tmfp->srp = srp;
+	tmfp->type = type;
+	atomic_set(&tmfp->state, SG_TMF_INFLIGHT);
+	return;
+}
+
+void sg_delete_tmf(struct sg_tmf *tmfp) {
+
+	list_del(&tmfp->tmf_list);
+	kfree(tmfp);
+	return;
+}
+
+void
+sg_finish_tmf (void *arg) {
+	struct scsi_cmnd *scmd = arg;
+	struct sg_request *srp = scmd->request->end_io_data;
+	struct sg_fd *sfp = srp->parentfp;
+	struct sg_tmf *tmfp;
+	struct list_head *curr;
+	bool found = false;
+	list_for_each(curr, &sfp->tmf_head) {
+		tmfp = (struct sg_tmf *)curr;
+		if (tmfp->srp == srp) {
+			found = true;
+			break;
+		}
+	}
+	if (found) {
+		atomic_set(&tmfp->state, SG_TMF_AWAIT_RCV);
+		tmfp->status = scmd->tmf_status;
+	}
+	return;
+}
+
+static int
+sg_send_tmf(struct sg_fd *sfp, struct sg_io_v4 *h4p)
+{
+	int res;
+	struct sg_request *srp;
+	unsigned long iflags;
+	struct request *rqq;
+	unsigned int type = h4p->request;
+	enum sg_rq_state rq_st;
+	struct scsi_device *dev;
+	struct sg_fd_pollable a_sfpoll;
+
+	switch (type) {
+		case SCSI_TMF_TASK_ABORT:
+			if (!mutex_trylock(&sfp->f_mutex))
+				return -EAGAIN;
+			xa_lock_irqsave(&sfp->srp_arr, iflags);
+
+			a_sfpoll.fp = sfp;
+			if (test_bit(SG_FFD_FORCE_PACKID, sfp->ffd_bm)) {
+				if (test_bit(SG_FFD_PREFER_TAG, sfp->ffd_bm)) {
+					a_sfpoll.find_by = SG_SEARCH_BY_TAG;
+					a_sfpoll.pack_id_tag = h4p->request_tag;
+				} else {
+					a_sfpoll.find_by = SG_SEARCH_BY_PACK_ID;
+					a_sfpoll.pack_id_tag = h4p->request_extra;
+				}
+			} else {
+				a_sfpoll.find_by = SG_SEARCH_ANY;
+				a_sfpoll.pack_id_tag = SG_PACK_ID_TAG_WILDCARD;
+			}
+
+			srp = sg_match_request_tmf(&a_sfpoll);
+
+			if (!srp) {
+				SG_LOG(6, sfp, "%s: cannot find srp\n", __func__);
+				res = -ENODATA;
+				goto out_irq;
+			}
+
+			rq_st = atomic_read_acquire(&srp->rq_st);
+			switch (rq_st) {
+				case SG_RQ_INFLIGHT:
+					break;
+				case SG_RQ_BUSY:
+					res = -EBUSY;
+					goto out_irq;
+				default:
+					res = -ENODATA;
+					goto out_irq;
+			}
+
+			sg_rq_chg_state_force_ulck(srp, SG_RQ_BUSY);
+
+			if (test_and_set_bit(SG_FRQ_PC_ABORTING, srp->frq_pc_bm)) {
+				SG_LOG(1, sfp, "%s: already aborting req\n", __func__);
+				goto out_irq;
+			}
+
+			xa_unlock_irqrestore(&sfp->srp_arr, iflags);
+
+			rqq = READ_ONCE(srp->rqq);
+			if (!rqq) {
+				SG_LOG(6, sfp, "%s: cannot find rqq\n", __func__);
+				res = -ENODATA;
+				goto out_abort;
+			}
+			sg_init_tmf(type, srp, sfp);
+
+			dev = sfp->parentdp->device;
+			res = scsi_send_tmf(dev, rqq, SCSI_TMF_TASK_ABORT, sg_finish_tmf);
+
+			SG_LOG(6, sfp, "%s: res == %d\n", __func__, res);
+
+			sg_rq_chg_state(srp, SG_RQ_BUSY, rq_st);
+			if (res) {
+				goto out_abort;
+			}
+			goto out_mutex;
+		default:
+			return -EINVAL;
+	}
+out_abort:
+	xa_lock_irqsave(&sfp->srp_arr, iflags);
+	clear_bit(SG_FRQ_PC_ABORTING, srp->frq_pc_bm);
+out_irq:
+	xa_unlock_irqrestore(&sfp->srp_arr, iflags);
+out_mutex:
+	mutex_unlock(&sfp->f_mutex);
+	return res;
+}
+
 static void
 sg_execute_cmd(struct sg_fd *sfp, struct sg_request *srp)
 {
@@ -3184,6 +3343,9 @@ sg_receive_v4(struct sg_fd *sfp, struct sg_request *srp, void __user *p, struct 
 {
 	int err;
 	u32 rq_result = srp->rq_result;
+	struct sg_tmf *tmfp;
+	struct list_head *curr;
+	bool found = false;
 
 	SG_LOG(3, sfp, "%s: p=%s, h4p=%s\n", __func__, (p ? "given" : "NULL"),
 	       (h4p ? "given" : "NULL"));
@@ -3221,7 +3383,21 @@ sg_receive_v4(struct sg_fd *sfp, struct sg_request *srp, void __user *p, struct 
 	}
 	sg_complete_v3v4(sfp, srp, err < 0);
 	sg_finish_scsi_blk_rq(srp);
-	sg_deact_request(sfp, srp);
+
+	list_for_each(curr, &sfp->tmf_head) {
+		tmfp = (struct sg_tmf *)curr;
+		if (tmfp->srp == srp) {
+			found = true;
+			break;
+		}
+	}
+	if (found) {
+		sg_rq_chg_state_force_ulck(srp, SG_RQ_AWAIT_TMF);
+	}
+	else {
+		sg_deact_request(sfp, srp);
+	}
+
 	return unlikely(err < 0) ? err : 0;
 }
 
@@ -3438,6 +3614,7 @@ sg_ctl_ioreceive(struct sg_fd *sfp, void __user *p)
 {
 	bool non_block = SG_IS_O_NONBLOCK(sfp);
 	int res;
+	bool found = false;
 	struct sg_io_v4 h4;
 	struct sg_io_v4 *h4p = &h4;
 	struct sg_device *sdp = sfp->parentdp;
@@ -3450,6 +3627,49 @@ sg_ctl_ioreceive(struct sg_fd *sfp, void __user *p)
 	/* Get first three 32 bit integers: guard, proto+subproto */
 	if (copy_from_user(h4p, p, SZ_SG_IO_V4))
 		return -EFAULT;
+
+	if (h4p->guard == 'Q' &&
+	    h4p->subprotocol == BSG_SUB_PROTOCOL_SCSI_TMF) {
+		struct sg_tmf *tmfp;
+		struct list_head *curr;
+		a_sfpoll.fp = sfp;
+		if (test_bit(SG_FFD_FORCE_PACKID, sfp->ffd_bm)) {
+			if (test_bit(SG_FFD_PREFER_TAG, sfp->ffd_bm)) {
+				a_sfpoll.find_by = SG_SEARCH_BY_TAG;
+				a_sfpoll.pack_id_tag = h4p->request_tag;
+			} else {
+				a_sfpoll.find_by = SG_SEARCH_BY_PACK_ID;
+				a_sfpoll.pack_id_tag = h4p->request_extra;
+			}
+		} else {
+			a_sfpoll.find_by = SG_SEARCH_ANY;
+			a_sfpoll.pack_id_tag = SG_PACK_ID_TAG_WILDCARD;
+		}
+
+		srp = sg_match_request_tmf(&a_sfpoll);
+		list_for_each(curr, &sfp->tmf_head) {
+			tmfp = (struct sg_tmf *)curr;
+			if (atomic_read(&tmfp->state) == SG_TMF_INFLIGHT) {
+				continue;
+			}
+			if (tmfp->srp == srp) {
+				found = true;
+				break;
+			}
+		}
+		if (found) {
+			h4p->response = tmfp->status;
+			res = copy_to_user(p, h4p, SZ_SG_IO_V4);
+			sg_delete_tmf(tmfp);
+			if (atomic_read(&srp->rq_st) == SG_RQ_AWAIT_TMF)
+				sg_deact_request(sfp, srp);
+			return res;
+		}
+		else {
+			return -EAGAIN;
+		}
+	}
+
 	/* for v4: protocol=0 --> SCSI;  subprotocol=0 --> SPC++ */
 	if (unlikely(h4p->guard != 'Q' || h4p->protocol != 0 || h4p->subprotocol != 0))
 		return -EPERM;
@@ -4322,6 +4542,35 @@ sg_match_request(struct sg_fd_pollable *sfp_p, bool use_tag, int id)
 			if (id == srp->pack_id)
 				return srp;
 		}
+	}
+	return NULL;
+}
+
+static struct sg_request *
+sg_match_request_tmf(struct sg_fd_pollable *a_sfpoll)
+{
+	unsigned long idx;
+	struct sg_request *srp;
+	struct sg_fd *sfp = a_sfpoll->fp;
+
+	switch (a_sfpoll->find_by) {
+	case SG_SEARCH_ANY:
+		xa_for_each(&sfp->srp_arr, idx, srp) {
+			return srp;
+		}
+		break;
+	case SG_SEARCH_BY_TAG:
+		xa_for_each(&sfp->srp_arr, idx, srp) {
+			if (a_sfpoll->pack_id_tag == srp->tag)
+				return srp;
+		}
+		break;
+	case SG_SEARCH_BY_PACK_ID:
+		xa_for_each(&sfp->srp_arr, idx, srp) {
+			if (a_sfpoll->pack_id_tag == srp->pack_id)
+				return srp;
+		}
+		break;
 	}
 	return NULL;
 }
@@ -5932,6 +6181,7 @@ sg_rq_end_io(struct request *rqq, blk_status_t status)
 	struct scsi_request *scsi_rp = scsi_req(rqq);
 	struct sg_device *sdp;
 	struct sg_fd *sfp;
+	struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(rqq);
 
 	sfp = srp->parentfp;
 	sdp = sfp->parentdp;
@@ -5950,6 +6200,10 @@ sg_rq_end_io(struct request *rqq, blk_status_t status)
 		} else {
 			srp->in_resid = a_resid;
 		}
+	}
+	if (scmd && unlikely(test_bit(SG_FRQ_PC_ABORTING, srp->frq_pc_bm))) {
+		if (scmd->result && (DID_ABORT_NO_EH << 16))
+			srp->rq_result |= (DID_ABORT_NO_EH << 16);
 	}
 	if (unlikely(test_bit(SG_FRQ_PC_ABORTING, srp->frq_pc_bm)) && sg_result_is_good(rq_result))
 		srp->rq_result |= (DRIVER_HARD << 24);
@@ -7028,6 +7282,7 @@ sg_setup_req_ws_helper(struct sg_comm_wr_t *cwrp)
 	case SG_RQ_SHR_SWAP:
 		break;
 	case SG_RQ_AWAIT_RCV:
+	case SG_RQ_AWAIT_TMF:
 	case SG_RQ_INFLIGHT:
 	case SG_RQ_BUSY:	/* too early for write-side req */
 		return ERR_PTR(-EBUSY);
@@ -7501,6 +7756,7 @@ sg_add_sfp(struct sg_device *sdp, struct file *filp)
 		return ERR_PTR(res);
 	}
 	sfp->idx = idx;
+	INIT_LIST_HEAD(&sfp->tmf_head);
 	__xa_set_mark(xadp, idx, SG_XA_FD_UNSHARED);
 	xa_unlock_irqrestore(xadp, iflags);
 	kref_get(&sdp->d_ref);	/* put in: sg_uc_remove_sfp() */
