@@ -3211,7 +3211,10 @@ check_scsi_status:
 		break;
 
 	case CS_ABORTED:
-		res = DID_RESET << 16;
+		if (cp->async_tmf)
+			res = DID_ABORT_NO_EH << 16;
+		else
+			res = DID_RESET << 16;
 		break;
 
 	case CS_DIF_ERROR:

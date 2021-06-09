@@ -161,6 +161,7 @@ static inline int scsi_is_wlun(u64 lun)
 #define DID_ALLOC_FAILURE 0x12  /* Space allocation on the device failed */
 #define DID_MEDIUM_ERROR  0x13  /* Medium error */
 #define DID_TRANSPORT_MARGINAL 0x14 /* Transport marginal errors */
+#define DID_ABORT_NO_EH	0x15	/* Command aborted, do not error handle */
 #define DRIVER_OK       0x00	/* Driver status                           */
 
 /*

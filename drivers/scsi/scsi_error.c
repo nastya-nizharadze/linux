@@ -1907,6 +1907,7 @@ enum scsi_disposition scsi_decide_disposition(struct scsi_cmnd *scmd)
 			return FAILED;
 		}
 	case DID_RESET:
+	case DID_ABORT_NO_EH:
 		return SUCCESS;
 	default:
 		return FAILED;
