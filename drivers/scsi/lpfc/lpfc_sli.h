@@ -452,5 +452,6 @@ struct lpfc_io_buf {
 	uint64_t ts_cmd_wqput;
 	uint64_t ts_isr_cmpl;
 	uint64_t ts_data_io;
+	struct scsi_cmnd *abt_scmd;
 #endif
 };

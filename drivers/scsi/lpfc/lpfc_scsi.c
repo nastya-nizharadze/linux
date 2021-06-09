@@ -528,6 +528,13 @@ lpfc_sli4_io_xri_aborted(struct lpfc_hba *phba,
 	list_for_each_entry_safe(psb, next_psb,
 		&qp->lpfc_abts_io_buf_list, list) {
 		if (psb->cur_iocbq.sli4_xritag == xri) {
+			struct lpfc_iocbq cur_iocbq = psb->cur_iocbq;
+			struct lpfc_io_buf *lpfc_cmd =
+				(struct lpfc_io_buf *)cur_iocbq.context1;
+			struct scsi_cmnd *scmd = lpfc_cmd->abt_scmd;
+			scmd->tmf_status = bf_get(lpfc_wcqe_xa_br, axri);
+			if (scmd->scsi_tmf_done)
+				scmd->scsi_tmf_done(scmd);
 			list_del_init(&psb->list);
 			psb->flags &= ~LPFC_SBUF_XBUSY;
 			psb->status = IOSTAT_SUCCESS;
@@ -4335,6 +4342,7 @@ lpfc_fcp_io_cmd_wqe_cmpl(struct lpfc_hba *phba, struct lpfc_iocbq *pwqeIn,
 		lpfc_io_ktime(phba, lpfc_cmd);
 	}
 #endif
+	lpfc_cmd->abt_scmd = cmd;
 	lpfc_cmd->pCmd = NULL;
 	spin_unlock(&lpfc_cmd->buf_lock);
 
