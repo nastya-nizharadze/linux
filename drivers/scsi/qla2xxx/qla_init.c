@@ -137,15 +137,20 @@ static void qla24xx_abort_sp_done(srb_t *sp, int res)
 {
 	struct srb_iocb *abt = &sp->u.iocb_cmd;
 	srb_t *orig_sp = sp->cmd_sp;
+	struct scsi_cmnd *cmd = GET_CMD_SP(orig_sp);
 
-	if (orig_sp)
+	if (orig_sp && QLA_SRB_NVME_CMD(orig_sp))
 		qla_wait_nvme_release_cmd_kref(orig_sp);
 
 	del_timer(&sp->u.iocb_cmd.timer);
 	if (sp->flags & SRB_WAKEUP_ON_COMP)
 		complete(&abt->u.abt.comp);
-	else
+	else {
+		cmd->tmf_status = abt->u.abt.comp_status;
+		if (cmd->scsi_tmf_done)
+			cmd->scsi_tmf_done(cmd);
 		sp->free(sp);
+	}
 }
 
 int qla24xx_async_abort_cmd(srb_t *cmd_sp, bool wait)
