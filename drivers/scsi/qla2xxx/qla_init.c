@@ -1908,7 +1908,7 @@ qla24xx_async_abort_command(srb_t *sp)
 		return qlafx00_fx_disc(vha, &vha->hw->mr.fcport,
 		    FXDISC_ABORT_IOCTL);
 
-	return qla24xx_async_abort_cmd(sp, true);
+	return qla24xx_async_abort_cmd(sp, false);
 }
 
 static void
