@@ -3303,15 +3303,22 @@ int scsi_send_tmf(struct scsi_device *sdev, struct request *rq, int tmf, void (*
 			}
 			scsi_abort_tmf(scmd);
 			break;
+		case SCSI_TMF_CLEAR_ACA:
+			if (!shost->hostt->tmf_clear_aca) {
+				res =  -ENODEV;
+				goto out;
+			}
+			res = shost->hostt->tmf_clear_aca(sdev);
+			break;
 		case SCSI_TMF_TASK_ABORT_SET:
 		case SCSI_TMF_CLEAR_TASK_SET:
-		case SCSI_TMF_CLEAR_ACA:
 		case SCSI_TMF_I_T_NEXUS_RESET:
 		case SCSI_TMF_LOGICAL_UNIT_RESET:
 		case SCSI_TMF_QUERY_TASK:
 		case SCSI_TMF_QUERY_TASK_SET:
 		case SCSI_TMF_QUERY_ASYNC_EVENT:
 		default:
+			res = -ENOTSUPP;
 			break;
 	}
 out:

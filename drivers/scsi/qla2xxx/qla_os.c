@@ -1689,6 +1689,28 @@ qla2x00_loop_reset(scsi_qla_host_t *vha)
 	return QLA_SUCCESS;
 }
 
+int
+qla2xxx_clear_aca (struct scsi_device *sdev) {
+	fc_port_t *fcport = (struct fc_port *) sdev->hostdata;
+	struct qla_hw_data *ha;
+	if (!fcport) {
+		return FAILED;
+	}
+
+	ha = fcport->vha->hw;
+	if ((ql2xasynctmfenable) && IS_FWI2_CAPABLE(ha)) {
+		if (qla2x00_async_tm_cmd(fcport, TCF_CLEAR_ACA, sdev->lun, 1) == QLA_SUCCESS)
+			return SUCCESS;
+		else
+			return FAILED;
+	}
+
+	if (qla24xx_issue_tmf("Clear ACA", TCF_CLEAR_ACA, fcport, sdev->lun, 1) == QLA_SUCCESS)
+		return SUCCESS;
+	else
+		return FAILED;
+}
+
 /*
  * The caller must ensure that no completion interrupts will happen
  * while this function is in progress.
@@ -7725,6 +7747,7 @@ struct scsi_host_template qla2xxx_driver_template = {
 	.scan_start		= qla2xxx_scan_start,
 	.change_queue_depth	= scsi_change_queue_depth,
 	.map_queues             = qla2xxx_map_queues,
+	.tmf_clear_aca		= qla2xxx_clear_aca,
 	.this_id		= -1,
 	.cmd_per_lun		= 3,
 	.sg_tablesize		= SG_ALL,

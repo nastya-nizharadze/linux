@@ -3306,8 +3306,8 @@ struct tsk_mgmt_cmd {
 	} p;
 };
 
-static int
-__qla24xx_issue_tmf(char *name, uint32_t type, struct fc_port *fcport,
+int
+qla24xx_issue_tmf(char *name, uint32_t type, struct fc_port *fcport,
     uint64_t l, int tag)
 {
 	int		rval, rval2;
@@ -3409,7 +3409,7 @@ qla24xx_abort_target(struct fc_port *fcport, uint64_t l, int tag)
 	if ((ql2xasynctmfenable) && IS_FWI2_CAPABLE(ha))
 		return qla2x00_async_tm_cmd(fcport, TCF_TARGET_RESET, l, tag);
 
-	return __qla24xx_issue_tmf("Target", TCF_TARGET_RESET, fcport, l, tag);
+	return qla24xx_issue_tmf("Target", TCF_TARGET_RESET, fcport, l, tag);
 }
 
 int
@@ -3420,7 +3420,7 @@ qla24xx_lun_reset(struct fc_port *fcport, uint64_t l, int tag)
 	if ((ql2xasynctmfenable) && IS_FWI2_CAPABLE(ha))
 		return qla2x00_async_tm_cmd(fcport, TCF_LUN_RESET, l, tag);
 
-	return __qla24xx_issue_tmf("Lun", TCF_LUN_RESET, fcport, l, tag);
+	return qla24xx_issue_tmf("Lun", TCF_LUN_RESET, fcport, l, tag);
 }
 
 int

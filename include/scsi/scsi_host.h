@@ -352,6 +352,12 @@ struct scsi_host_template {
 #define SCSI_ADAPTER_RESET	1
 #define SCSI_FIRMWARE_RESET	2
 
+	/* This function sends Task Management Function Clear ACA
+	 *
+	 * Status: OPTIONAL
+	 */
+
+	int (*tmf_clear_aca)(struct scsi_device *device);
 
 	/*
 	 * Name of proc directory

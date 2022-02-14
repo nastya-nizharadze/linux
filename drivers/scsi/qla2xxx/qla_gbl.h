@@ -427,6 +427,9 @@ qla24xx_abort_target(struct fc_port *, uint64_t, int);
 extern int
 qla24xx_lun_reset(struct fc_port *, uint64_t, int);
 extern int
+qla24xx_issue_tmf(char *name, uint32_t type, struct fc_port *fcport,
+    uint64_t l, int tag);
+extern int
 qla2x00_eh_wait_for_pending_commands(scsi_qla_host_t *, unsigned int,
 	uint64_t, enum nexus_wait_type);
 extern int
