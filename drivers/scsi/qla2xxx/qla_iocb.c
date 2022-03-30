@@ -3107,6 +3107,7 @@ qla24xx_els_iocb(srb_t *sp, struct els_entry_24xx *els_iocb)
 {
 	struct bsg_job *bsg_job = sp->u.bsg_job;
 	struct fc_bsg_request *bsg_request = bsg_job->request;
+	scsi_qla_host_t *vha = sp->vha;
 
         els_iocb->entry_type = ELS_IOCB_TYPE;
         els_iocb->entry_count = 1;
@@ -3126,6 +3127,9 @@ qla24xx_els_iocb(srb_t *sp, struct els_entry_24xx *els_iocb)
 	els_iocb->d_id[0] = sp->fcport->d_id.b.al_pa;
 	els_iocb->d_id[1] = sp->fcport->d_id.b.area;
 	els_iocb->d_id[2] = sp->fcport->d_id.b.domain;
+	els_iocb->s_id[0] = vha->d_id.b.al_pa;
+	els_iocb->s_id[1] = vha->d_id.b.area;
+	els_iocb->s_id[2] = vha->d_id.b.domain;
         els_iocb->control_flags = 0;
         els_iocb->rx_byte_count =
             cpu_to_le32(bsg_job->reply_payload.payload_len);

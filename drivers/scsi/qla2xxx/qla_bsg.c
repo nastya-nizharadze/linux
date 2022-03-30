@@ -312,6 +312,8 @@ qla2x00_process_els(struct bsg_job *bsg_job)
 		/* make sure the rport is logged in,
 		 * if not perform fabric login
 		 */
+		printk("used to login here\n");
+		/*
 		if (qla2x00_fabric_login(vha, fcport, &nextlid)) {
 			ql_dbg(ql_dbg_user, vha, 0x7003,
 			    "Failed to login port %06X for ELS passthru.\n",
@@ -319,6 +321,7 @@ qla2x00_process_els(struct bsg_job *bsg_job)
 			rval = -EIO;
 			goto done;
 		}
+		*/
 	} else {
 		/* Allocate a dummy fcport structure, since functions
 		 * preparing the IOCB and mailbox command retrieves port
